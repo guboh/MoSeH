@@ -61,11 +61,19 @@ def solve(
         True if the algorithm converged, False otherwise.
     """
 
-    model_order_specifier = initial_model_order_specifier # Rename for clarity further down
+    # If the initial model order specifier is an integer, convert it so that len() can be used on it
+    if isinstance(initial_model_order_specifier, int):
+        model_order_specifier = _IntAsLen(initial_model_order_specifier)
+    else:
+        model_order_specifier = initial_model_order_specifier
+
+    # Check validity of the initial model order specifier
+    if not hasattr(model_order_specifier, "__len__") and not callable(model_order_specifier.__len__):
+        raise TypeError("Initial model order specifier must be an int or have a __len__ method.")
 
     if beta is None:
-        beta = np.zeros(len(initial_model_order_specifier))
-
+        beta = np.zeros(len(model_order_specifier))
+    # Check the size of the initial coefficient vector, if provided
     elif len(model_order_specifier) != len(beta):
         raise ValueError(
             "The total number of parameters in the model order specifier and the "
@@ -103,7 +111,7 @@ def solve(
         fim_extra_diagonal_block = fim_full[nr_of_parameters:, nr_of_parameters:]
         fim_extra_cross_term_block = fim_full[nr_of_parameters:, :nr_of_parameters]
         covariance_extra = fim_extra_diagonal_block - fim_extra_cross_term_block @ np.linalg.solve(fim, fim_extra_cross_term_block.T)
-        
+
         # Transform (whiten) the Lagrange multipliers (corresponding to the negative of the score for the extra parameters)
         lagrange_multipliers = -score_full[nr_of_parameters:]
         transformed_lagrange_multipliers = np.linalg.solve(sqrtm(covariance_extra), lagrange_multipliers)
@@ -123,6 +131,10 @@ def solve(
         # Update the model order and the coefficient vector size based on the decision index
         model_order_specifier, beta = update_operator(model_order_specifier, decision_index, beta)
 
+    # If the initial model order specifier was an integer, convert it back to an integer
+    if isinstance(initial_model_order_specifier, int):
+        model_order_specifier = len(model_order_specifier)
+
     return model_order_specifier, beta, converged
 
 def _fisher_scoring(residual_function, jacobian_function, beta, group_lengths=None):
@@ -140,7 +152,7 @@ def _fisher_scoring(residual_function, jacobian_function, beta, group_lengths=No
     group_lengths : list of int (optional)
         The lengths of subgroups of data points, i.e., the lengths of subgroups of the residuals and Jacobian matrices.
         If None, the data points are not grouped.
-    
+
     Returns:
     --------
     beta : np.ndarray
@@ -200,3 +212,12 @@ def _fisher_scoring(residual_function, jacobian_function, beta, group_lengths=No
             break
 
     return beta, covariance
+
+class _IntAsLen:
+    def __init__(self, value):
+        if not isinstance(value, int):
+            raise TypeError("Value must be an int.")
+        self.value = value
+
+    def __len__(self):
+        return self.value
