@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moseh"
+version = "0.1.0"
+description = "Model-Order Selection via Sequential Lagrange Multiplier Hypothesis Testing"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Gustav Bohlin", email = "guboh@hotmail.com" }]
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+]
+
+[tool.setuptools]
+packages = ["moseh"]

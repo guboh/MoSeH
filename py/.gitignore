@@ -1,0 +1,6 @@
+# Python related files and directories
+dist/
+moseh.egg-info/
+__pycache__/
+tests/__pycache__/
+.pytest_cache/
