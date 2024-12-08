@@ -161,23 +161,6 @@ def _fisher_scoring(residual_function, jacobian_function, beta, group_lengths=No
         The estimated covariance matrix.
     """
 
-    def _estimate_variance(beta, residual, group_lengths, unbiased=True):
-        # Create initual variance estimates
-        sigma_squared = np.zeros(len(group_lengths))
-        start = 0
-
-        # Calculate the variance estimates for the data groups
-        for idx, length in enumerate(group_lengths):
-            end = start + length
-            if unbiased:
-                sigma_squared[idx] = np.sum(residual[start:end]**2) / (length - len(beta))
-            else:
-                sigma_squared[idx] = np.sum(residual[start:end]**2) / length
-
-        covariance = np.diag(np.repeat(sigma_squared, group_lengths))
-
-        return covariance
-
     # Create initual variance estimates
     residual = residual_function(beta)
 
@@ -212,6 +195,43 @@ def _fisher_scoring(residual_function, jacobian_function, beta, group_lengths=No
             break
 
     return beta, covariance
+
+
+def _estimate_variance(beta, residual, group_lengths, unbiased=True):
+    """
+    Estimate the variance of the residuals.
+
+    Parameters:
+    -----------
+    beta : np.ndarray
+        The estimated coefficients.
+    residual : np.ndarray
+        The residuals.
+    group_lengths : list of int
+        The lengths of subgroups of data points, i.e., the lengths of subgroups of the residuals and Jacobian matrices.
+    unbiased : bool (optional)
+        If True, the unbiased estimator of the variance is used.
+
+    Returns:
+    --------
+    covariance : np.ndarray
+        The estimated covariance matrix.
+    """
+    # Create initual variance estimates
+    sigma_squared = np.zeros(len(group_lengths))
+    start = 0
+
+    # Calculate the variance estimates for the data groups
+    for idx, length in enumerate(group_lengths):
+        end = start + length
+        if unbiased:
+            sigma_squared[idx] = np.sum(residual[start:end]**2) / (length - len(beta))
+        else:
+            sigma_squared[idx] = np.sum(residual[start:end]**2) / length
+
+    covariance = np.diag(np.repeat(sigma_squared, group_lengths))
+
+    return covariance
 
 class _IntAsLen:
     def __init__(self, value):
