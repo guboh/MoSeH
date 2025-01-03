@@ -1,4 +1,4 @@
-# Copyright 2024 (c) Gustav Bohlin
+# Copyright (c) 2024 Gustav Bohlin
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,11 +13,13 @@
 # limitations under the License.
 
 import numpy as np
+from joblib import Parallel, delayed
 from scipy.stats import chi2
 from scipy.linalg import sqrtm
 
 def solve(
-        residual_function, jacobian_function,
+        input_data, target_data,
+        model_function, jacobian_function,
         initial_model_order_specifier,
         expansion_operator,
         update_operator,
@@ -30,10 +32,18 @@ def solve(
 
     Parameters:
     -----------
-    residual_function : Callable[model_order_specifier, beta]
-        Returns the specified model's residual evaluated at beta.
-    jacobian_function : Callable[model_order_specifier, beta]
-        Returns the specified model's Jacobian matrix evaluated at beta.
+    input_data : Union[np.ndarrqay, List[np.ndarray]]
+        An input data matrix, or a list of input data matrices. Each matrix corresponds to a group of data points.
+        The number of rows in each matrix must match the number of input variables in the model.
+        The number of columns in each matrix must match the number of data points in the corresponding group.
+    target_data : Union[np.ndarrqay, List[np.ndarray]]
+        A 1D array of targets, or a list of 1D arrays of target values. Each array corresponds to a group of data points.
+        The number of elements in the list must match the number of input data matrices,
+        and the number of elements in each sub-array must match the number of data points in the corresponding group.
+    model_function : Callable[model_order_specifier, input_data, beta]
+        Returns the specified model function evaluated at the given input data and coefficients beta.
+    jacobian_function : Callable[model_order_specifier, input_data, beta]
+        Returns the specified model's Jacobian matrix evaluated at the given input data and coefficients beta.
     initial_model_order_specifier : ModelOrderSpecifier
         The initial model order specifier. It can be, e.g., an integer, a list of integers, or some other more complex object.
         It must implement __len__(self) -> int to return the number of parameters in the model.
@@ -41,11 +51,8 @@ def solve(
         Returns the full model's residual and Jacobian matrix evaluated at beta.
     update_operator : Callable[model_order_specifier, decision_index, beta]
         Returns updated model order specifier and beta.
-    group_lengths : list of int (optional)
-        The lengths of subgroups of data points, i.e., the lengths of subgroups of the residuals and Jacobian matrices.
-        If None, the data points are not grouped.
-    beta : np.ndarray (optional)
-        The initial coefficients.
+    beta : Union[np.ndarray, List[np.ndarray]] (optional)
+        The initial coefficients, or a list of initial coefficients, one for each group of data points.
     alpha : float (optional)
         The significance level for the Lagrange multiplier (score) test.
     max_iterations : int (optional)
@@ -71,20 +78,43 @@ def solve(
     if not hasattr(model_order_specifier, "__len__") and not callable(model_order_specifier.__len__):
         raise TypeError("Initial model order specifier must be an int or have a __len__ method.")
 
+    # Repackage the input and target data if they are not lists
+    if not isinstance(input_data, list):
+        input_data = [input_data]
+    if not isinstance(target_data, list):
+        target_data = [target_data]
+
+    # Check if the number of input data matrices and target data arrays match
+    if len(input_data) != len(target_data):
+        raise ValueError("The number of input data matrices and target data arrays must match.")
+
+    # Check that the sizes the input and target data matrices make sense
+    for i in range(len(input_data)):
+        # Check that the target data is a 1D array
+        if target_data.ndim != 1:
+            raise ValueError("The target data must be a 1D array.")
+        if input_data[i].shape[0] != len(target_data[i]):
+            raise ValueError("The number of columns in the input data matrix must match the number of target values.")
+
     if beta is None:
-        beta = np.zeros(len(model_order_specifier))
-    # Check the size of the initial coefficient vector, if provided
-    elif len(model_order_specifier) != len(beta):
-        raise ValueError(
-            "The total number of parameters in the model order specifier and the "
-            "number of coefficients in the initial coefficient vector must match."
-        )
+        beta = [np.zeros(len(model_order_specifier)) for _ in range(len(input_data))]
+    elif not isinstance(beta, list):
+        beta = [beta for _ in range(len(input_data))]
+    else:
+        if len(beta) != len(input_data):
+            raise ValueError("The number of initial coefficient vectors must match the number of input data matrices.")
+        for i in range(len(beta)):
+            if len(beta[i]) != len(model_order_specifier):
+                raise ValueError(
+                    "The total number of parameters in the model order specifier and the "
+                    "number of coefficients in the initial coefficient vector must match."
+                )
 
     # Main loop
     converged = False
     for _ in range(max_iterations):
         # Set up the residual and Jacobian matrix functions for the currently selected model
-        residual_s = lambda x: residual_function(model_order_specifier, x)
+        residual_s = lambda x: model_function(model_order_specifier, x)
         jacobian_s = lambda x: jacobian_function(model_order_specifier, x)
 
         beta, covariance = _fisher_scoring(residual_s, jacobian_s, beta, group_lengths)
@@ -137,13 +167,13 @@ def solve(
 
     return model_order_specifier, beta, converged
 
-def _fisher_scoring(residual_function, jacobian_function, beta, group_lengths=None):
+def _fisher_scoring(model_function, jacobian_function, beta, group_lengths=None):
     """
     Estimate the parameters beta using Fisher scoring.
 
     Parameters:
     -----------
-    residual_function : Callable[beta]
+    model_function : Callable[beta]
         Returns the model's residual evaluated at beta.
     jacobian_function : Callable[beta]
         Returns the model's Jacobian matrix evaluated at beta.
@@ -162,7 +192,7 @@ def _fisher_scoring(residual_function, jacobian_function, beta, group_lengths=No
     """
 
     # Create initual variance estimates
-    residual = residual_function(beta)
+    residual = model_function(beta)
 
     if group_lengths is None:
         group_lengths = [len(residual)]
@@ -185,7 +215,7 @@ def _fisher_scoring(residual_function, jacobian_function, beta, group_lengths=No
         beta += np.linalg.solve(fim, score)
 
         # Calculate the new residual
-        residual = residual_function(beta)
+        residual = model_function(beta)
 
         # Calculate the new covariance matrix
         covariance = _estimate_variance(beta, residual, group_lengths)
