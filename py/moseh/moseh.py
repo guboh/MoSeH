@@ -14,17 +14,16 @@
 
 import numpy as np
 from joblib import Parallel, delayed
-from scipy.stats import chi2
+from scipy.stats import chi2, mode
 from scipy.linalg import sqrtm
 
 def solve(
-        input_data, target_data,
+        input_data_list, target_data_list,
         model_function, jacobian_function,
         initial_model_order_specifier,
         expansion_operator,
         update_operator,
-        group_lengths=None,
-        beta=None, alpha=0.05,
+        theta_list=None, alpha=0.05,
         max_iterations=100
     ):
     """
@@ -32,27 +31,29 @@ def solve(
 
     Parameters:
     -----------
-    input_data : Union[np.ndarrqay, List[np.ndarray]]
-        An input data matrix, or a list of input data matrices. Each matrix corresponds to a group of data points.
+    input_data_list : Union[np.ndarrqay, List[np.ndarray]]
+        An input data matrix, or a list of input data matrices. Each matrix corresponds to a sub-problem (group of data points).
         The number of rows in each matrix must match the number of input variables in the model.
-        The number of columns in each matrix must match the number of data points in the corresponding group.
-    target_data : Union[np.ndarrqay, List[np.ndarray]]
-        A 1D array of targets, or a list of 1D arrays of target values. Each array corresponds to a group of data points.
+        The number of columns in each matrix must match the number of data points in the corresponding sub-problem.
+    target_data_list : Union[np.ndarrqay, List[np.ndarray]]
+        A 1D array of targets, or a list of 1D arrays of target values. Each array corresponds to a sub-problem (group of data points).
         The number of elements in the list must match the number of input data matrices,
-        and the number of elements in each sub-array must match the number of data points in the corresponding group.
-    model_function : Callable[model_order_specifier, input_data, beta]
-        Returns the specified model function evaluated at the given input data and coefficients beta.
-    jacobian_function : Callable[model_order_specifier, input_data, beta]
-        Returns the specified model's Jacobian matrix evaluated at the given input data and coefficients beta.
+        and the number of elements in each sub-array must match the number of data points in the corresponding sub-problem.
+    model_function : Callable[model_order_specifier : ModelOrderSpecifier, theta : np.ndarray, input_data : np.ndarray] -> np.ndarray
+        Returns the specified model function evaluated with parameters theta at the given input data.
+    jacobian_function : Callable[model_order_specifier : ModelOrderSpecifier, theta : np.ndarray, input_data : np.ndarray] -> np.ndarray
+        Returns the specified model's Jacobian matrix evaluated with parameters theta at the given input data.
     initial_model_order_specifier : ModelOrderSpecifier
         The initial model order specifier. It can be, e.g., an integer, a list of integers, or some other more complex object.
         It must implement __len__(self) -> int to return the number of parameters in the model.
-    expansion_operator : Callable[model_order_specifier, beta, covariance]
-        Returns the full model's residual and Jacobian matrix evaluated at beta.
-    update_operator : Callable[model_order_specifier, decision_index, beta]
-        Returns updated model order specifier and beta.
-    beta : Union[np.ndarray, List[np.ndarray]] (optional)
-        The initial coefficients, or a list of initial coefficients, one for each group of data points.
+    expansion_operator : Callable[model_order_specifier : ModelOrderSpecifier] -> tuple[ModelOrderSpecifier, np.ndarray]
+        Returns the expaned model order specifier together with an expansion matrix.
+        The expansion matrix can be used to pad theta with zeros to match the size of the expanded model.
+    update_operator : Callable[model_order_specifier : ModelOrderSpecifier, decision_index : int] -> tuple[ModelOrderSpecifier, np.ndarray]
+        Returns updated model order specifier together with a selection matrix.
+        The selection matrix can be used to select the relevant parts of theta, the score and the Fisher information matrix.
+    theta_list : Union[np.ndarray, List[np.ndarray]] (optional)
+        The initial parameters, or a list of initial parameters, one for each sub-problem (group of data points).
     alpha : float (optional)
         The significance level for the Lagrange multiplier (score) test.
     max_iterations : int (optional)
@@ -62,8 +63,8 @@ def solve(
     --------
     model_order_specifier : ModelOrderSpecifier
         The selected model order specifier.
-    beta : np.ndarray
-        The estimated coefficients.
+    theta : np.ndarray
+        The estimated parameters.
     converged : bool
         True if the algorithm converged, False otherwise.
     """
@@ -74,171 +75,167 @@ def solve(
     else:
         model_order_specifier = initial_model_order_specifier
 
+    #########################
+    # Input data validation #
+    #########################
+
     # Check validity of the initial model order specifier
     if not hasattr(model_order_specifier, "__len__") and not callable(model_order_specifier.__len__):
         raise TypeError("Initial model order specifier must be an int or have a __len__ method.")
 
     # Repackage the input and target data if they are not lists
-    if not isinstance(input_data, list):
-        input_data = [input_data]
-    if not isinstance(target_data, list):
-        target_data = [target_data]
+    if not isinstance(input_data_list, list):
+        input_data_list = [input_data_list]
+    if not isinstance(target_data_list, list):
+        target_data_list = [target_data_list]
 
     # Check if the number of input data matrices and target data arrays match
-    if len(input_data) != len(target_data):
+    if len(input_data_list) != len(target_data_list):
         raise ValueError("The number of input data matrices and target data arrays must match.")
 
     # Check that the sizes the input and target data matrices make sense
-    for i in range(len(input_data)):
+    for input_data, target_data in zip(input_data_list, target_data_list):
         # Check that the target data is a 1D array
         if target_data.ndim != 1:
             raise ValueError("The target data must be a 1D array.")
-        if input_data[i].shape[0] != len(target_data[i]):
-            raise ValueError("The number of columns in the input data matrix must match the number of target values.")
+        if input_data.shape[0] != len(target_data):
+            raise ValueError("The number of rows in the input data matrix must match the number of target values.")
 
-    if beta is None:
-        beta = [np.zeros(len(model_order_specifier)) for _ in range(len(input_data))]
-    elif not isinstance(beta, list):
-        beta = [beta for _ in range(len(input_data))]
+    if theta_list is None:
+        theta_list = [np.zeros(len(model_order_specifier)) for _ in range(len(input_data_list))]
+    elif not isinstance(theta_list, list):
+        theta_list = [theta_list for _ in range(len(input_data_list))]
     else:
-        if len(beta) != len(input_data):
+        if len(theta_list) != len(input_data_list):
             raise ValueError("The number of initial coefficient vectors must match the number of input data matrices.")
-        for i in range(len(beta)):
-            if len(beta[i]) != len(model_order_specifier):
+        for i in range(len(theta_list)):
+            if len(theta_list[i]) != len(model_order_specifier):
                 raise ValueError(
                     "The total number of parameters in the model order specifier and the "
-                    "number of coefficients in the initial coefficient vector must match."
+                    "number of parameters in the initial coefficient vector must match."
                 )
 
-    # Main loop
+    #############
+    # Main loop #
+    #############
+
     converged = False
     for _ in range(max_iterations):
-        # Set up the residual and Jacobian matrix functions for the currently selected model
-        residual_s = lambda x: model_function(model_order_specifier, x)
-        jacobian_s = lambda x: jacobian_function(model_order_specifier, x)
-
-        beta, covariance = _fisher_scoring(residual_s, jacobian_s, beta, group_lengths)
-
         # Expand the model
-        residual_full, jacobian_full, nr_of_constraints = expansion_operator(model_order_specifier, beta, covariance)
+        model_order_specifier_full, expansion_matrix = expansion_operator(model_order_specifier)
 
-        # Calculate the full model's score and Fisher information matrix (fim)
-        score_full = jacobian_full.T @ np.linalg.solve(covariance, residual_full)
-        fim_full = jacobian_full.T @ np.linalg.solve(covariance, jacobian_full)
+        # Create appropriate model functions and Jacobian functions for the full model
+        model_function_full = lambda theta, input_data: model_function(model_order_specifier_full, theta, input_data)
+        jacobian_function_full = lambda theta, input_data: jacobian_function(model_order_specifier_full, theta, input_data)
+        calculation_subroutine = lambda theta, input_data, target_data: _calculate_score_fim_and_lm_test_statistic(
+            model_function_full, jacobian_function_full, theta, input_data, target_data
+        )
 
-        # Calculate the Lagrange multiplier (score) test statistic
-        lm_test_statistic = score_full.T @ np.linalg.solve(fim_full, score_full) # @TODO: Can we reuse previous calculations to save time?
+        # Calculate the score, the Fisher information matrix, and the Lagrange multiplier (score) test statistic for the full model
+        # in parallel for each sub-problem
+        result = Parallel(n_jobs=-1)(
+            delayed(calculation_subroutine)(expansion_matrix @ theta, input_data, target_data) # Note that theta is expanded to match the full model
+            for theta, input_data, target_data in zip(theta_list, input_data_list, target_data_list)
+        )
+        score_list, fim_list, lm_test_statistic_list = zip(*result) # Unpack the results
+
+        # Calculate the total Lagrange multiplier (score) test statistic
+        lm_test_statistic = np.sum(lm_test_statistic_list)
 
         # Perform the hypothesis test
+        nr_of_constraints = len(model_order_specifier_full) - len(model_order_specifier)
         if lm_test_statistic <= chi2.ppf(1-alpha, nr_of_constraints):
             converged = True
             break
 
-        # Calculate the Schur complement of the full model's Fisher information matrix.
-        # This corresponds to the covariance of the extra full model parameters, given the current model parameters.
-        nr_of_parameters = len(model_order_specifier)
-        fim = fim_full[:nr_of_parameters, :nr_of_parameters]
-        fim_extra_diagonal_block = fim_full[nr_of_parameters:, nr_of_parameters:]
-        fim_extra_cross_term_block = fim_full[nr_of_parameters:, :nr_of_parameters]
-        covariance_extra = fim_extra_diagonal_block - fim_extra_cross_term_block @ np.linalg.solve(fim, fim_extra_cross_term_block.T)
+        # Calculate the decision indeces in parallel for each sub-problem
+        result = Parallel(n_jobs=-1)(
+            delayed(_decision_subroutine)(score, fim) for score, fim in zip(score_list, fim_list)
+        )
+        decision_indeces, _ = zip(*result) # Unpack the results
 
-        # Transform (whiten) the Lagrange multipliers (corresponding to the negative of the score for the extra parameters)
-        lagrange_multipliers = -score_full[nr_of_parameters:]
-        transformed_lagrange_multipliers = np.linalg.solve(sqrtm(covariance_extra), lagrange_multipliers)
+        # Calculate the decision index as the mode of the decision indeces
+        # @TODO: Check other selection rules, e.g., using an average of the transformed scores instead
+        decision_index, _ = mode(decision_indeces)
 
-        # Calculate the decision index
-        nr_of_groups = len(group_lengths) if group_lengths is not None else 1
-        if (nr_of_constraints % nr_of_groups) != 0:
-            raise ValueError("Someting is wrong. The number of parameters must be divisible by the number of groups.")
-        nr_of_constraints_per_group = nr_of_constraints // nr_of_groups
-        decision_index = np.argmax(
-            np.median(
-                np.abs(transformed_lagrange_multipliers).reshape(nr_of_groups, nr_of_constraints_per_group),
-                axis=1
-            )
+        # Update the model order specifier and the selection matrix, based on the decision index
+        model_order_specifier, selection_matrix = update_operator(model_order_specifier, decision_index)
+
+        # Set up helper functions for the Fisher scoring steps
+        residual_function = lambda theta, input_data, target_data: model_function(model_order_specifier, theta, input_data) - target_data
+        fisher_scoring_step_subroutine = lambda score, fim, theta, input_data, target_data: _fisher_scoring_step(
+            score, fim, theta, input_data, target_data, residual_function
         )
 
-        # Update the model order and the coefficient vector size based on the decision index
-        model_order_specifier, beta = update_operator(model_order_specifier, decision_index, beta)
+        # Perform Fisher scoring steps with backtracking line search in parallel for each sub-problem
+        theta_list = Parallel(n_jobs=-1)(
+            delayed(fisher_scoring_step_subroutine)(
+                selection_matrix @ score,                    # Note that the score is contracted to match the selected model
+                selection_matrix @ fim @ selection_matrix.T, # Note that the FIM is contracted to match the selected model
+                selection_matrix @ expansion_matrix @ theta, # Note that theta is expanded and contracted to match the selected model
+                input_data, target_data)
+            for score, fim, theta, input_data, target_data in zip(score_list, fim_list, theta_list, input_data_list, target_data_list)
+        )
 
     # If the initial model order specifier was an integer, convert it back to an integer
     if isinstance(initial_model_order_specifier, int):
         model_order_specifier = len(model_order_specifier)
 
-    return model_order_specifier, beta, converged
+    return model_order_specifier, theta_list, converged
 
-def _fisher_scoring(model_function, jacobian_function, beta, group_lengths=None):
+def _calculate_score_fim_and_lm_test_statistic(
+        model_function, jacobian_function, theta, input_data, target_data):
     """
-    Estimate the parameters beta using Fisher scoring.
+    Calculate the score, Fisher information matrix (FIM), and Lagrange multiplier (score) test statistic for the expanded model.
 
     Parameters:
     -----------
-    model_function : Callable[beta]
-        Returns the model's residual evaluated at beta.
-    jacobian_function : Callable[beta]
-        Returns the model's Jacobian matrix evaluated at beta.
-    beta : np.ndarray
-        The initial coefficients.
-    group_lengths : list of int (optional)
-        The lengths of subgroups of data points, i.e., the lengths of subgroups of the residuals and Jacobian matrices.
-        If None, the data points are not grouped.
+    model_function : Callable[theta : np.ndarray, input_data : np.ndarray] -> np.ndarray
+        Returns the specified model function evaluated with parameters theta at the given input data.
+    jacobian_function : Callable[theta : np.ndarray, input_data : np.ndarray] -> np.ndarray
+        Returns the specified model's Jacobian matrix evaluated with parameters theta at the given input data.
+    theta : np.ndarray
+        The estimated parameters.
+    input_data : np.ndarray
+        The input data matrix.
+    target_data : np.ndarray
+        The target data array.
 
     Returns:
     --------
-    beta : np.ndarray
-        The estimated coefficients.
-    covariance : np.ndarray
-        The estimated covariance matrix.
+    score : np.ndarray
+        The score vector.
+    fim : np.ndarray
+        The Fisher information matrix.
+    lm_test_statistic : float
+        The Lagrange multiplier (score) test statistic.
     """
+    # Calculate the residual and the Jacobian matrix
+    residual = model_function(theta, input_data) - target_data
+    jacobian = jacobian_function(theta, input_data)
 
-    # Create initual variance estimates
-    residual = model_function(beta)
+    # Calculate the covariance matrix
+    covariance = _estimate_covariance(theta, residual)
 
-    if group_lengths is None:
-        group_lengths = [len(residual)]
+    # Calculate the full model's score and Fisher information matrix (FIM)
+    score = -jacobian.T @ np.linalg.solve(covariance, residual) # Note the minus sign, due to the chosen definition of the residual
+    fim = jacobian.T @ np.linalg.solve(covariance, jacobian)
 
-    covariance = _estimate_variance(beta, residual, group_lengths)
+    # Calculate the Lagrange multiplier (score) test statistic
+    lm_test_statistic = score.T @ np.linalg.solve(fim, score)
 
-    # Fisher scoring
-    for _ in range(100):
-        # Calculate the Jacobian matrix
-        jacobian = jacobian_function(beta)
+    return score, fim, lm_test_statistic
 
-        # Calculate the score
-        score = jacobian.T @ np.linalg.solve(covariance, residual)
-
-        # Calculate the Fisher information matrix (FIM)
-        fim = jacobian.T @ np.linalg.solve(covariance, jacobian)
-
-        # Update the coefficients
-        beta_old = beta
-        beta += np.linalg.solve(fim, score)
-
-        # Calculate the new residual
-        residual = model_function(beta)
-
-        # Calculate the new covariance matrix
-        covariance = _estimate_variance(beta, residual, group_lengths)
-
-        # Check for convergence
-        if np.linalg.norm(beta - beta_old) < 1e-6: # @TODO: Work out a better convergence criterion. Can we use the LM test statistic?
-            break
-
-    return beta, covariance
-
-
-def _estimate_variance(beta, residual, group_lengths, unbiased=True):
+def _estimate_covariance(theta, residual, unbiased=True):
     """
-    Estimate the variance of the residuals.
+    Estimate the covariance of the residuals.
 
     Parameters:
     -----------
-    beta : np.ndarray
-        The estimated coefficients.
+    theta : np.ndarray
+        The estimated parameters.
     residual : np.ndarray
         The residuals.
-    group_lengths : list of int
-        The lengths of subgroups of data points, i.e., the lengths of subgroups of the residuals and Jacobian matrices.
     unbiased : bool (optional)
         If True, the unbiased estimator of the variance is used.
 
@@ -247,21 +244,106 @@ def _estimate_variance(beta, residual, group_lengths, unbiased=True):
     covariance : np.ndarray
         The estimated covariance matrix.
     """
-    # Create initual variance estimates
-    sigma_squared = np.zeros(len(group_lengths))
-    start = 0
 
-    # Calculate the variance estimates for the data groups
-    for idx, length in enumerate(group_lengths):
-        end = start + length
-        if unbiased:
-            sigma_squared[idx] = np.sum(residual[start:end]**2) / (length - len(beta))
-        else:
-            sigma_squared[idx] = np.sum(residual[start:end]**2) / length
+    if unbiased:
+        sigma_squared = np.sum(residual**2) / (len(residual) - len(theta))
+    else:
+        sigma_squared = np.sum(residual**2) / len(residual)
 
-    covariance = np.diag(np.repeat(sigma_squared, group_lengths))
+    covariance = np.diag(np.full(len(residual), sigma_squared))
 
     return covariance
+
+def _decision_subroutine(score, fim):
+    """
+    Calculate the decision index based on the score and the Fisher information matrix (FIM).
+
+    Parameters:
+    -----------
+    score : np.ndarray
+        The score vector.
+    fim : np.ndarray
+        The Fisher information matrix.
+
+    Returns:
+    --------
+    decision_index : int
+        The decision index.
+    transformed_score : np.ndarray
+        The transformed score vector.
+    """
+    # Transform (whiten) the score vector
+    transformed_score = np.linalg.solve(sqrtm(fim), score)
+    # Calculate the decision index.
+    # The index corresponds to the parameter that has the largest absolute value in the transformed score vector.
+    # If the index corresponds to a constrained parameter, the constraint is relaxed.
+    decision_index = np.argmax(np.abs(transformed_score))
+    return decision_index, transformed_score
+
+def _fisher_scoring_step(
+        score, fim, theta,
+        input_data, target_data,
+        residual_function=None,
+        armijo_constant=1e-4,
+        max_iterations=100):
+    """
+    Update the selected parameters theta using a single step of Fisher's scoring algorithm with a backtracking line search.
+
+    Parameters:
+    -----------
+    score : np.ndarray
+        The score vector.
+    fim : np.ndarray
+        The Fisher information matrix.
+    theta : np.ndarray
+        The estimated parameters.
+    input_data : np.ndarray
+        The input data matrix.
+    target_data : np.ndarray
+        The target data array.
+    residual_function : Callable[theta : np.ndarray, input_data : np.ndarray, target_data : np.ndarray] -> np.ndarray (optional)
+        Returns the specified model's residual evaluated with parameters theta at the given input and target data.
+        It is needed by the line search. If not provided, the line search is skipped.
+    armijo_constant : float (optional)
+        The Armijo condition parameter.
+    max_iterations : int (optional)
+        The maximum number of iterations in the line search.
+
+    Returns:
+    --------
+    theta_selection : np.ndarray
+        The estimated parameters for the selected model.
+    """
+    # Calculate the Fisher scoring step
+    fisher_step = np.linalg.solve(fim, score)
+    
+    # Update the selected parameters immediately, if no line search is to be performed
+    if not residual_function:
+        return theta + fisher_step
+    
+    # Set up the backtracking line search
+    directional_derivative = score @ fisher_step
+    if directional_derivative < 0:
+        raise ValueError(
+            "The directional derivative of the log-likelihood must be positive. "
+            "Something is wrong with the input to the Fisher scoring step."
+        )
+    ssr_old = np.sum(residual_function(theta, input_data, target_data)**2)
+    damping_factor = 1.0
+
+    # Perform the backtracking line search
+    for _ in range(max_iterations):
+        theta_new = theta + damping_factor * fisher_step
+        ssr_new = np.sum(residual_function(theta_new, input_data, target_data)**2)
+
+        if ssr_new <= ssr_old - armijo_constant * damping_factor * directional_derivative:
+            return theta_new
+
+        damping_factor /= 2
+
+    raise ValueError("The backtracking line search did not converge.")
+
+
 
 class _IntAsLen:
     def __init__(self, value):

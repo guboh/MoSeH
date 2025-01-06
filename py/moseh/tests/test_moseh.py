@@ -16,25 +16,45 @@ import moseh.moseh as moseh
 import numpy as np
 
 def test_moseh():
-    def residual_function(model_order_specifier, beta):
-        return np.array([1, 2, 3, 4, 5])
+    def model_function(model_order_specifier, beta, input_data):
+        data_length = len(input_data)
+        return np.arange(1, data_length + 1)
 
-    def jacobian_function(model_order_specifier, beta):
-        return np.array([[1, 1], [1, 0], [1, 0], [1, 0], [1, 0]])
+    def jacobian_function(model_order_specifier, beta, input_data):
+        data_length = len(input_data)
+        model_order = len(model_order_specifier)
+        if model_order > data_length:
+            raise ValueError("Model order cannot be greater than data length")
+        jacobian = np.zeros((data_length, model_order))
+        for i in range(model_order):
+            jacobian[i, i] = 1
+        return jacobian
 
-    def expansion_operator(model_order_specifier, beta, covariance):
-        return np.array([1, 2, 3, 4, 5]), np.array([[1, 1, 0], [1, 0, 1], [1, 0, 0], [1, 0, 0], [1, 0, 0]]), 1
+    def expansion_operator(model_order_specifier):
+        model_order = len(model_order_specifier)
+        expansion_matrix = np.vstack((np.eye(model_order), np.zeros(model_order)))
+        new_model_order_specifier = moseh._IntAsLen(model_order + 1)
+        return new_model_order_specifier, expansion_matrix
 
-    def update_operator(model_order_specifier, decision_index, beta):
-        return model_order_specifier, beta
+    def update_operator(model_order_specifier, decision_index):
+        model_order = len(model_order_specifier)
+        if decision_index < model_order:
+            selection_matrix = np.column_stack((np.eye(model_order), np.zeros(model_order)))
+            new_model_order_specifier = model_order_specifier
+        else:
+            selection_matrix = np.eye(model_order + 1)
+            new_model_order_specifier = moseh._IntAsLen(model_order + 1)
+        return new_model_order_specifier, selection_matrix
 
     initial_model_order_specifier = 2
 
+    input_data = np.array([1, 2, 3, 4, 5])
+    target_data = np.array([2, 4, 6, 8, 10])
+
     model_order_specifier, beta, converged = moseh.solve(
-        residual_function, jacobian_function,
+        input_data, target_data,
+        model_function, jacobian_function,
         initial_model_order_specifier,
         expansion_operator,
-        update_operator,
-        beta=np.zeros(2),
-        max_iterations=100
+        update_operator
     )
