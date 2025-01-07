@@ -282,7 +282,7 @@ def _decision_subroutine(score, fim):
 
 def _fisher_scoring_step(
         score, fim, theta,
-        input_data, target_data,
+        input_data=None, target_data=None,
         residual_function=None,
         armijo_constant=1e-4,
         max_iterations=100):
@@ -297,10 +297,10 @@ def _fisher_scoring_step(
         The Fisher information matrix.
     theta : np.ndarray
         The estimated parameters.
-    input_data : np.ndarray
-        The input data matrix.
-    target_data : np.ndarray
-        The target data array.
+    input_data : np.ndarray (optional)
+        The input data matrix. It is needed by the line search.
+    target_data : np.ndarray (optional)
+        The target data array. It is needed by the line search.
     residual_function : Callable[theta : np.ndarray, input_data : np.ndarray, target_data : np.ndarray] -> np.ndarray (optional)
         Returns the specified model's residual evaluated with parameters theta at the given input and target data.
         It is needed by the line search. If not provided, the line search is skipped.
@@ -321,6 +321,11 @@ def _fisher_scoring_step(
     if not residual_function:
         return theta + fisher_step
     
+    # Check that the input and target data are provided if the residual function is provided
+    if residual_function:
+        if input_data is None or target_data is None:
+            raise ValueError("The input data and target data must be provided if the residual function is provided.")
+
     # Set up the backtracking line search
     directional_derivative = score @ fisher_step
     if directional_derivative < 0:
