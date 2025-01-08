@@ -24,7 +24,8 @@ def solve(
         expansion_operator,
         update_operator,
         theta_list=None, alpha=0.05,
-        max_iterations=100
+        max_iterations=100,
+        verbose=True
     ):
     """
     Model-Order Selection via Sequential Lagrange Multiplier Hypothesis Testing (MoSeH).
@@ -58,6 +59,8 @@ def solve(
         The significance level for the Lagrange multiplier (score) test.
     max_iterations : int (optional)
         The maximum number of iterations.
+    verbose : bool (optional)
+        If True, print the number of iterations, etc.
 
     Returns:
     --------
@@ -120,7 +123,9 @@ def solve(
     #############
 
     converged = False
-    for _ in range(max_iterations):
+    for iteration in range(max_iterations):
+        print("--- Iteration {} ---".format(iteration + 1)) if verbose else None
+
         # Expand the model
         model_order_specifier_full, expansion_matrix = expansion_operator(model_order_specifier)
 
@@ -141,10 +146,13 @@ def solve(
 
         # Calculate the total Lagrange multiplier (score) test statistic
         lm_test_statistic = np.sum(lm_test_statistic_list)
+        print("LM test statistic: {}".format(lm_test_statistic)) if verbose else None
 
         # Perform the hypothesis test
-        nr_of_constraints = len(model_order_specifier_full) - len(model_order_specifier)
-        if lm_test_statistic <= chi2.ppf(1-alpha, nr_of_constraints):
+        nr_of_constraints = len(input_data) * (len(model_order_specifier_full) - len(model_order_specifier))
+        critical_value = chi2.ppf(1-alpha, nr_of_constraints)
+        print("Critical value: {}".format(critical_value)) if verbose else None
+        if lm_test_statistic <= critical_value:
             converged = True
             break
 
@@ -157,9 +165,11 @@ def solve(
         # Calculate the decision index as the mode of the decision indeces
         # @TODO: Check other selection rules, e.g., using an average of the transformed scores instead
         decision_index, _ = mode(decision_indeces)
+        print("Decision index: {}".format(decision_index)) if verbose else None
 
         # Update the model order specifier and the selection matrix, based on the decision index
         model_order_specifier, selection_matrix = update_operator(model_order_specifier, decision_index)
+        print("Model order: {}\n".format(len(model_order_specifier))) if verbose else None
 
         # Set up helper functions for the Fisher scoring steps
         residual_function = lambda theta, input_data, target_data: model_function(model_order_specifier, theta, input_data) - target_data
