@@ -110,12 +110,12 @@ def solve(
         theta_list = [theta_list for _ in range(len(input_data_list))]
     else:
         if len(theta_list) != len(input_data_list):
-            raise ValueError("The number of initial coefficient vectors must match the number of input data matrices.")
+            raise ValueError("The number of initial parameter vectors must match the number of input data matrices.")
         for i in range(len(theta_list)):
             if len(theta_list[i]) != len(model_order_specifier):
                 raise ValueError(
                     "The total number of parameters in the model order specifier and the "
-                    "number of parameters in the initial coefficient vector must match."
+                    "number of parameters in the initial parameter vector must match."
                 )
 
     #############
@@ -123,13 +123,30 @@ def solve(
     #############
 
     converged = False
+    # The padding matrix is used to pad theta with zeros to account for newly added parameters.
+    # It is initialized as the identity matrix, since no parameters have been added yet.
+    padding_matrix = np.eye(len(model_order_specifier))
     for iteration in range(max_iterations):
         print("--- Iteration {} ---".format(iteration + 1)) if verbose else None
 
-        # Expand the model
+        # Set up helper functions for the Fisher scoring algorithm
+        model_function_selected = lambda theta, input_data: model_function(model_order_specifier, theta, input_data)
+        jacobian_function_selected = lambda theta, input_data: jacobian_function(model_order_specifier, theta, input_data)
+        fisher_scoring_subroutine = lambda theta, input_data, target_data: _fisher_scoring(
+            model_function_selected, jacobian_function_selected, theta, input_data, target_data
+        )
+
+        # Perform Fisher scoring with backtracking line search in parallel for each sub-problem
+        result = Parallel(n_jobs=-1)(
+            delayed(fisher_scoring_subroutine)(padding_matrix @ theta, input_data, target_data) # Note that theta is padded with zeros, to match the selected model
+            for theta, input_data, target_data in zip(theta_list, input_data_list, target_data_list)
+        )
+        theta_list, _ = zip(*result) # Unpack the results
+
+        # Expand the model, preparing for the Lagrange multiplier (score) test
         model_order_specifier_full, expansion_matrix = expansion_operator(model_order_specifier)
 
-        # Create appropriate model functions and Jacobian functions for the full model
+        # Create appropriate model functions and Jacobian functions for the full model, necessary for the Lagrange multiplier (score) test
         model_function_full = lambda theta, input_data: model_function(model_order_specifier_full, theta, input_data)
         jacobian_function_full = lambda theta, input_data: jacobian_function(model_order_specifier_full, theta, input_data)
         calculation_subroutine = lambda theta, input_data, target_data: _calculate_score_fim_and_lm_test_statistic(
@@ -156,9 +173,12 @@ def solve(
             converged = True
             break
 
+        # Set up a helper function for the constraint relaxation decision
+        decision_subroutine = lambda score, fim: _calculate_decision_index_and_transformed_score(model_order_specifier, score, fim)
+
         # Calculate the decision indeces in parallel for each sub-problem
         result = Parallel(n_jobs=-1)(
-            delayed(_decision_subroutine)(score, fim) for score, fim in zip(score_list, fim_list)
+            delayed(decision_subroutine)(score, fim) for score, fim in zip(score_list, fim_list)
         )
         decision_indeces, _ = zip(*result) # Unpack the results
 
@@ -171,27 +191,135 @@ def solve(
         model_order_specifier, selection_matrix = update_operator(model_order_specifier, decision_index)
         print("Model order: {}\n".format(len(model_order_specifier))) if verbose else None
 
-        # Set up helper functions for the Fisher scoring steps
-        residual_function = lambda theta, input_data, target_data: model_function(model_order_specifier, theta, input_data) - target_data
-        fisher_scoring_step_subroutine = lambda score, fim, theta, input_data, target_data: _fisher_scoring_step(
-            score, fim, theta, input_data, target_data, residual_function
-        )
-
-        # Perform Fisher scoring steps with backtracking line search in parallel for each sub-problem
-        theta_list = Parallel(n_jobs=-1)(
-            delayed(fisher_scoring_step_subroutine)(
-                selection_matrix @ score,                    # Note that the score is contracted to match the selected model
-                selection_matrix @ fim @ selection_matrix.T, # Note that the FIM is contracted to match the selected model
-                selection_matrix @ expansion_matrix @ theta, # Note that theta is expanded and contracted to match the selected model
-                input_data, target_data)
-            for score, fim, theta, input_data, target_data in zip(score_list, fim_list, theta_list, input_data_list, target_data_list)
-        )
+        # Update the padding matrix, to account for the newly added parameters in the next iteration
+        padding_matrix = selection_matrix @ expansion_matrix
 
     # If the initial model order specifier was an integer, convert it back to an integer
     if isinstance(initial_model_order_specifier, int):
         model_order_specifier = len(model_order_specifier)
 
     return model_order_specifier, theta_list, converged
+
+def _estimate_covariance(theta, residual, unbiased=True):
+    """
+    Estimate the covariance of the residuals.
+
+    Parameters:
+    -----------
+    theta : np.ndarray
+        The estimated parameters.
+    residual : np.ndarray
+        The residuals.
+    unbiased : bool (optional)
+        If True, the unbiased estimator of the variance is used.
+
+    Returns:
+    --------
+    covariance : np.ndarray
+        The estimated covariance matrix.
+    """
+
+    if unbiased:
+        sigma_squared = np.sum(residual**2) / (len(residual) - len(theta))
+    else:
+        sigma_squared = np.sum(residual**2) / len(residual)
+
+    covariance = np.diag(np.full(len(residual), sigma_squared))
+
+    return covariance
+
+def _fisher_scoring(
+        model_function, jacobian_function,
+        theta, input_data, target_data,
+        max_iterations=100,
+        line_search=False,
+        armijo_constant=1e-4,
+        max_line_search_iterations=100):
+    """
+    Update the parameters theta using the Fisher scoring algorithm with (optional) backtracking line search.
+
+    Parameters:
+    -----------
+    model_function : Callable[theta : np.ndarray, input_data : np.ndarray] -> np.ndarray
+        Returns the specified model function evaluated with parameters theta at the given input data.
+    jacobian_function : Callable[model_order_specifier : ModelOrderSpecifier, theta : np.ndarray, input_data : np.ndarray] -> np.ndarray
+        Returns the specified model's Jacobian matrix evaluated with parameters theta at the given input data.
+    theta : np.ndarray
+        The estimated parameters.
+    input_data : np.ndarray (optional)
+        The input data matrix. It is needed by the line search.
+    target_data : np.ndarray (optional)
+        The target data array. It is needed by the line search.
+    max_iterations : int (optional)
+        The maximum number of iterations in the Fisher scoring algorithm.
+    line_search : bool (optional)
+        If True, a backtracking line search is performed in each Fisher scoring step.
+    armijo_constant : float (optional)
+        The Armijo condition parameter.
+    max_line_search_iterations : int (optional)
+        The maximum number of iterations in the line search.
+
+    Returns:
+    --------
+    theta_new : np.ndarray
+        The updated parameters.
+    converged : bool
+        True if the algorithm converged, False otherwise.
+    """
+    # Fisher scoring
+    converged = False
+    for _ in range(max_iterations):
+        # Calculate the residual and the Jacobian matrix
+        residual = model_function(theta, input_data) - target_data
+        jacobian = jacobian_function(theta, input_data)
+        
+        # Estimate the covariance matrix
+        covariance = _estimate_covariance(theta, residual)
+
+        # Calculate the score and the Fisher information matrix (FIM)
+        score = -jacobian.T @ np.linalg.solve(covariance, residual) # Note the minus sign, due to the chosen definition of the residual
+        fim = jacobian.T @ np.linalg.solve(covariance, jacobian)
+
+        # Calculate the Fisher scoring step
+        fisher_step = np.linalg.solve(fim, score)
+        
+        # Update the selected parameters immediately, if no line search is to be performed
+        if not line_search:
+            converged = True
+            theta_new = theta + fisher_step
+            return theta_new, converged
+
+        # Else, set up and perform the backtracking line search
+        directional_derivative = score @ fisher_step
+        if directional_derivative < 0:
+            raise ValueError(
+                "The directional derivative of the log-likelihood must be positive. "
+                "Something is wrong with the input to the Fisher scoring step."
+            )
+        ssr_old = np.sum((model_function(theta, input_data) - target_data)**2)
+        damping_factor = 1.0
+
+        # Perform the backtracking line search
+        line_search_converged = False
+        for _ in range(max_line_search_iterations):
+            theta_new = theta + damping_factor * fisher_step
+            ssr_new = np.sum((model_function(theta_new, input_data) - target_data)**2)
+
+            if ssr_new <= ssr_old - armijo_constant * damping_factor * directional_derivative:
+                line_search_converged = True
+                break
+
+            damping_factor /= 2
+
+        if not line_search_converged:
+            raise ValueError("The backtracking line search did not converge.")
+
+        # Check for Fisher scoring algorithm convergence
+        if np.linalg.norm(theta_new - theta) < 1e-6:
+            converged = True
+            break
+
+    return theta_new, converged
 
 def _calculate_score_fim_and_lm_test_statistic(
         model_function, jacobian_function, theta, input_data, target_data):
@@ -236,44 +364,19 @@ def _calculate_score_fim_and_lm_test_statistic(
 
     return score, fim, lm_test_statistic
 
-def _estimate_covariance(theta, residual, unbiased=True):
-    """
-    Estimate the covariance of the residuals.
-
-    Parameters:
-    -----------
-    theta : np.ndarray
-        The estimated parameters.
-    residual : np.ndarray
-        The residuals.
-    unbiased : bool (optional)
-        If True, the unbiased estimator of the variance is used.
-
-    Returns:
-    --------
-    covariance : np.ndarray
-        The estimated covariance matrix.
-    """
-
-    if unbiased:
-        sigma_squared = np.sum(residual**2) / (len(residual) - len(theta))
-    else:
-        sigma_squared = np.sum(residual**2) / len(residual)
-
-    covariance = np.diag(np.full(len(residual), sigma_squared))
-
-    return covariance
-
-def _decision_subroutine(score, fim):
+def _calculate_decision_index_and_transformed_score(model_order_specifier, score_full, fim_full):
     """
     Calculate the decision index based on the score and the Fisher information matrix (FIM).
 
     Parameters:
     -----------
-    score : np.ndarray
-        The score vector.
-    fim : np.ndarray
-        The Fisher information matrix.
+    model_order_specifier : ModelOrderSpecifier
+        The model order specifier of the currently selected model. It can be, e.g., an integer, a list of integers, or some other more complex object.
+        It must implement __len__(self) -> int to return the number of parameters in the model.
+    score_full : np.ndarray
+        The score vector of the full model.
+    fim_full : np.ndarray
+        The Fisher information matrix of the full model.
 
     Returns:
     --------
@@ -282,83 +385,22 @@ def _decision_subroutine(score, fim):
     transformed_score : np.ndarray
         The transformed score vector.
     """
+    # Calculate the Schur complement of the full model's Fisher information matrix.
+    # This corresponds to the covariance of the extra full model parameters, given the current model parameters.
+    nr_of_selected_parameters = len(model_order_specifier)
+    fim = fim_full[:nr_of_selected_parameters, :nr_of_selected_parameters]
+    fim_extra_diagonal_block = fim_full[nr_of_selected_parameters:, nr_of_selected_parameters:]
+    fim_extra_cross_term_block = fim_full[nr_of_selected_parameters:, :nr_of_selected_parameters]
+    covariance_extra = fim_extra_diagonal_block - fim_extra_cross_term_block @ np.linalg.solve(fim, fim_extra_cross_term_block.T)
+
     # Transform (whiten) the score vector
-    transformed_score = np.linalg.solve(sqrtm(fim), score)
+    transformed_score = np.linalg.solve(sqrtm(covariance_extra), score_full[nr_of_selected_parameters:])
+
     # Calculate the decision index.
     # The index corresponds to the parameter that has the largest absolute value in the transformed score vector.
     # If the index corresponds to a constrained parameter, the constraint is relaxed.
-    decision_index = np.argmax(np.abs(transformed_score))
+    decision_index = nr_of_selected_parameters + np.argmax(np.abs(transformed_score))
     return decision_index, transformed_score
-
-def _fisher_scoring_step(
-        score, fim, theta,
-        input_data=None, target_data=None,
-        residual_function=None,
-        armijo_constant=1e-4,
-        max_iterations=100):
-    """
-    Update the selected parameters theta using a single step of Fisher's scoring algorithm with a backtracking line search.
-
-    Parameters:
-    -----------
-    score : np.ndarray
-        The score vector.
-    fim : np.ndarray
-        The Fisher information matrix.
-    theta : np.ndarray
-        The estimated parameters.
-    input_data : np.ndarray (optional)
-        The input data matrix. It is needed by the line search.
-    target_data : np.ndarray (optional)
-        The target data array. It is needed by the line search.
-    residual_function : Callable[theta : np.ndarray, input_data : np.ndarray, target_data : np.ndarray] -> np.ndarray (optional)
-        Returns the specified model's residual evaluated with parameters theta at the given input and target data.
-        It is needed by the line search. If not provided, the line search is skipped.
-    armijo_constant : float (optional)
-        The Armijo condition parameter.
-    max_iterations : int (optional)
-        The maximum number of iterations in the line search.
-
-    Returns:
-    --------
-    theta_selection : np.ndarray
-        The estimated parameters for the selected model.
-    """
-    # Calculate the Fisher scoring step
-    fisher_step = np.linalg.solve(fim, score)
-    
-    # Update the selected parameters immediately, if no line search is to be performed
-    if not residual_function:
-        return theta + fisher_step
-    
-    # Check that the input and target data are provided if the residual function is provided
-    if residual_function:
-        if input_data is None or target_data is None:
-            raise ValueError("The input data and target data must be provided if the residual function is provided.")
-
-    # Set up the backtracking line search
-    directional_derivative = score @ fisher_step
-    if directional_derivative < 0:
-        raise ValueError(
-            "The directional derivative of the log-likelihood must be positive. "
-            "Something is wrong with the input to the Fisher scoring step."
-        )
-    ssr_old = np.sum(residual_function(theta, input_data, target_data)**2)
-    damping_factor = 1.0
-
-    # Perform the backtracking line search
-    for _ in range(max_iterations):
-        theta_new = theta + damping_factor * fisher_step
-        ssr_new = np.sum(residual_function(theta_new, input_data, target_data)**2)
-
-        if ssr_new <= ssr_old - armijo_constant * damping_factor * directional_derivative:
-            return theta_new
-
-        damping_factor /= 2
-
-    raise ValueError("The backtracking line search did not converge.")
-
-
 
 class _IntAsLen:
     def __init__(self, value):
