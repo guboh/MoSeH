@@ -25,7 +25,12 @@ def solve(
         update_operator,
         theta_list=None, alpha=0.05,
         max_iterations=100,
-        verbose=True
+        force_continuation=False,
+        verbose=True,
+        max_inner_iterations=100,
+        line_search=True,
+        armijo_constant=1e-4,
+        max_line_search_iterations=100
     ):
     """
     Model-Order Selection via Sequential Lagrange Multiplier Hypothesis Testing (MoSeH).
@@ -59,8 +64,18 @@ def solve(
         The significance level for the Lagrange multiplier (score) test.
     max_iterations : int (optional)
         The maximum number of iterations.
+    force_continuation : bool (optional)
+        If True, the algorithm will continue even if the Lagrange multiplier (score) test fails.
     verbose : bool (optional)
         If True, print the number of iterations, etc.
+    max_inner_iterations : int (optional)
+        The maximum number of iterations in the inner loop of the Fisher scoring algorithm.
+    line_search : bool (optional)
+        If True, a backtracking line search is performed in each Fisher scoring step.
+    armijo_constant : float (optional)
+        The Armijo condition parameter.
+    max_line_search_iterations : int (optional)
+        The maximum number of iterations in the line search.
 
     Returns:
     --------
@@ -70,6 +85,8 @@ def solve(
         The estimated parameters.
     converged : bool
         True if the algorithm converged, False otherwise.
+    result_dict : dict
+        A dictionary containing the Lagrange multiplier (score) test statistic, the critical value, the AIC, the BIC, and the exact BIC.
     """
 
     # If the initial model order specifier is an integer, convert it so that len() can be used on it
@@ -122,7 +139,16 @@ def solve(
     # Main loop #
     #############
 
+    result_dict = {
+        'LM test statistic': [],
+        'Critical value': [],
+        'AIC': [],
+        'BIC': [],
+        'BIC exact': []
+    }
+
     converged = False
+
     # The padding matrix is used to pad theta with zeros to account for newly added parameters.
     # It is initialized as the identity matrix, since no parameters have been added yet.
     padding_matrix = np.eye(len(model_order_specifier))
@@ -133,7 +159,13 @@ def solve(
         model_function_selected = lambda theta, input_data: model_function(model_order_specifier, theta, input_data)
         jacobian_function_selected = lambda theta, input_data: jacobian_function(model_order_specifier, theta, input_data)
         fisher_scoring_subroutine = lambda theta, input_data, target_data: _fisher_scoring(
-            model_function_selected, jacobian_function_selected, theta, input_data, target_data
+            model_function_selected,
+            jacobian_function_selected,
+            theta, input_data, target_data,
+            max_iterations=max_inner_iterations,
+            line_search=line_search,
+            armijo_constant=armijo_constant,
+            max_line_search_iterations=max_line_search_iterations
         )
 
         # Perform Fisher scoring with backtracking line search in parallel for each sub-problem
@@ -150,7 +182,7 @@ def solve(
         model_function_full = lambda theta, input_data: model_function(model_order_specifier_full, theta, input_data)
         jacobian_function_full = lambda theta, input_data: jacobian_function(model_order_specifier_full, theta, input_data)
         calculation_subroutine = lambda theta, input_data, target_data: _calculate_score_fim_and_lm_test_statistic(
-            model_function_full, jacobian_function_full, theta, input_data, target_data
+            model_order_specifier, model_function_full, jacobian_function_full, theta, input_data, target_data
         )
 
         # Calculate the score, the Fisher information matrix, and the Lagrange multiplier (score) test statistic for the full model
@@ -159,19 +191,35 @@ def solve(
             delayed(calculation_subroutine)(expansion_matrix @ theta, input_data, target_data) # Note that theta is expanded to match the full model
             for theta, input_data, target_data in zip(theta_list, input_data_list, target_data_list)
         )
-        score_list, fim_list, lm_test_statistic_list = zip(*result) # Unpack the results
+        score_list, fim_list, lm_test_statistic_list, aic_list, bic_list, bic_exact_list = zip(*result) # Unpack the results
 
-        # Calculate the total Lagrange multiplier (score) test statistic
+        # Calculate the total Lagrange multiplier (score) test statistic, AIC, BIC, and exact BIC
         lm_test_statistic = np.sum(lm_test_statistic_list)
-        print("LM test statistic: {}".format(lm_test_statistic)) if verbose else None
+        aic = np.sum(aic_list)
+        bic = np.sum(bic_list)
+        bic_exact = np.sum(bic_exact_list)
 
-        # Perform the hypothesis test
+        # Prepare for the hypothesis test
         nr_of_constraints = len(input_data) * (len(model_order_specifier_full) - len(model_order_specifier))
         critical_value = chi2.ppf(1-alpha, nr_of_constraints)
+
+        # Print the results of the current iteration
+        print("LM test statistic: {}".format(lm_test_statistic)) if verbose else None
         print("Critical value: {}".format(critical_value)) if verbose else None
+        print("AIC: {}, BIC: {}, BIC_exact: {}".format(aic, bic, bic_exact)) if verbose else None
+
+        # Save results for later analysis
+        result_dict['LM test statistic'].append(lm_test_statistic)
+        result_dict['Critical value'].append(critical_value)
+        result_dict['AIC'].append(aic)
+        result_dict['BIC'].append(bic)
+        result_dict['BIC exact'].append(bic_exact)
+
+        # Perform the hypothesis test
         if lm_test_statistic <= critical_value:
             converged = True
-            break
+            if not force_continuation:
+                break
 
         # Set up a helper function for the constraint relaxation decision
         decision_subroutine = lambda score, fim: _calculate_decision_index_and_transformed_score(model_order_specifier, score, fim)
@@ -198,7 +246,7 @@ def solve(
     if isinstance(initial_model_order_specifier, int):
         model_order_specifier = len(model_order_specifier)
 
-    return model_order_specifier, theta_list, converged
+    return model_order_specifier, theta_list, converged, result_dict
 
 def _estimate_covariance(theta, residual, unbiased=True):
     """
@@ -232,9 +280,11 @@ def _fisher_scoring(
         model_function, jacobian_function,
         theta, input_data, target_data,
         max_iterations=100,
-        line_search=False,
+        line_search=True,
         armijo_constant=1e-4,
-        max_line_search_iterations=100):
+        max_line_search_iterations=100,
+
+        ):
     """
     Update the parameters theta using the Fisher scoring algorithm with (optional) backtracking line search.
 
@@ -252,8 +302,6 @@ def _fisher_scoring(
         The target data array. It is needed by the line search.
     max_iterations : int (optional)
         The maximum number of iterations in the Fisher scoring algorithm.
-    line_search : bool (optional)
-        If True, a backtracking line search is performed in each Fisher scoring step.
     armijo_constant : float (optional)
         The Armijo condition parameter.
     max_line_search_iterations : int (optional)
@@ -272,7 +320,7 @@ def _fisher_scoring(
         # Calculate the residual and the Jacobian matrix
         residual = model_function(theta, input_data) - target_data
         jacobian = jacobian_function(theta, input_data)
-        
+
         # Estimate the covariance matrix
         covariance = _estimate_covariance(theta, residual)
 
@@ -282,37 +330,34 @@ def _fisher_scoring(
 
         # Calculate the Fisher scoring step
         fisher_step = np.linalg.solve(fim, score)
-        
-        # Update the selected parameters immediately, if no line search is to be performed
-        if not line_search:
-            converged = True
+
+        if line_search:
+            # Perform the backtracking line search
+            directional_derivative = score @ fisher_step
+            if directional_derivative < 0.1:
+                raise ValueError(
+                    "The directional derivative of the log-likelihood must be positive. "
+                    "Something is wrong with the input to the Fisher scoring step."
+                )
+            ssr_old = np.sum((model_function(theta, input_data) - target_data)**2)
+            damping_factor = 1.0
+
+            # Perform the backtracking line search
+            line_search_converged = False
+            for _ in range(max_line_search_iterations):
+                theta_new = theta + damping_factor * fisher_step
+                ssr_new = np.sum((model_function(theta_new, input_data) - target_data)**2)
+
+                if ssr_new <= ssr_old - armijo_constant * damping_factor * directional_derivative:
+                    line_search_converged = True
+                    break
+
+                damping_factor /= 2
+
+            if not line_search_converged:
+                raise ValueError("The backtracking line search did not converge.")
+        else:
             theta_new = theta + fisher_step
-            return theta_new, converged
-
-        # Else, set up and perform the backtracking line search
-        directional_derivative = score @ fisher_step
-        if directional_derivative < 0:
-            raise ValueError(
-                "The directional derivative of the log-likelihood must be positive. "
-                "Something is wrong with the input to the Fisher scoring step."
-            )
-        ssr_old = np.sum((model_function(theta, input_data) - target_data)**2)
-        damping_factor = 1.0
-
-        # Perform the backtracking line search
-        line_search_converged = False
-        for _ in range(max_line_search_iterations):
-            theta_new = theta + damping_factor * fisher_step
-            ssr_new = np.sum((model_function(theta_new, input_data) - target_data)**2)
-
-            if ssr_new <= ssr_old - armijo_constant * damping_factor * directional_derivative:
-                line_search_converged = True
-                break
-
-            damping_factor /= 2
-
-        if not line_search_converged:
-            raise ValueError("The backtracking line search did not converge.")
 
         # Check for Fisher scoring algorithm convergence
         if np.linalg.norm(theta_new - theta) < 1e-6:
@@ -322,15 +367,18 @@ def _fisher_scoring(
     return theta_new, converged
 
 def _calculate_score_fim_and_lm_test_statistic(
-        model_function, jacobian_function, theta, input_data, target_data):
+        model_order_specifier, model_function_full, jacobian_function_full, theta, input_data, target_data):
     """
     Calculate the score, Fisher information matrix (FIM), and Lagrange multiplier (score) test statistic for the expanded model.
 
     Parameters:
     -----------
-    model_function : Callable[theta : np.ndarray, input_data : np.ndarray] -> np.ndarray
+    model_order_specifier : ModelOrderSpecifier
+        The model order specifier of the currently selected model. It can be, e.g., an integer, a list of integers, or some other more complex object.
+        It must implement __len__(self) -> int to return the number of parameters in the model.
+    model_function_full : Callable[theta : np.ndarray, input_data : np.ndarray] -> np.ndarray
         Returns the specified model function evaluated with parameters theta at the given input data.
-    jacobian_function : Callable[theta : np.ndarray, input_data : np.ndarray] -> np.ndarray
+    jacobian_function_full : Callable[theta : np.ndarray, input_data : np.ndarray] -> np.ndarray
         Returns the specified model's Jacobian matrix evaluated with parameters theta at the given input data.
     theta : np.ndarray
         The estimated parameters.
@@ -349,8 +397,8 @@ def _calculate_score_fim_and_lm_test_statistic(
         The Lagrange multiplier (score) test statistic.
     """
     # Calculate the residual and the Jacobian matrix
-    residual = model_function(theta, input_data) - target_data
-    jacobian = jacobian_function(theta, input_data)
+    residual = model_function_full(theta, input_data) - target_data
+    jacobian = jacobian_function_full(theta, input_data)
 
     # Calculate the covariance matrix
     covariance = _estimate_covariance(theta, residual)
@@ -359,10 +407,17 @@ def _calculate_score_fim_and_lm_test_statistic(
     score = -jacobian.T @ np.linalg.solve(covariance, residual) # Note the minus sign, due to the chosen definition of the residual
     fim = jacobian.T @ np.linalg.solve(covariance, jacobian)
 
+    nr_of_data_points = len(target_data)
+    nr_of_selected_parameters = len(model_order_specifier)
+    ssr = np.sum(residual**2)
+    aic = nr_of_data_points * np.log(ssr / nr_of_data_points) + 2 * nr_of_selected_parameters
+    bic = nr_of_data_points * np.log(ssr / nr_of_data_points) + nr_of_selected_parameters * np.log(nr_of_selected_parameters)
+    bic_exact = nr_of_data_points * np.log(ssr / nr_of_data_points) + np.log(np.linalg.det(fim[:nr_of_selected_parameters, :nr_of_selected_parameters]))
+
     # Calculate the Lagrange multiplier (score) test statistic
     lm_test_statistic = score.T @ np.linalg.solve(fim, score)
 
-    return score, fim, lm_test_statistic
+    return score, fim, lm_test_statistic, aic, bic, bic_exact
 
 def _calculate_decision_index_and_transformed_score(model_order_specifier, score_full, fim_full):
     """
