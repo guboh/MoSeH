@@ -302,6 +302,8 @@ def _fisher_scoring(
         The target data array. It is needed by the line search.
     max_iterations : int (optional)
         The maximum number of iterations in the Fisher scoring algorithm.
+    line_search : bool (optional)
+        If True, a backtracking line search is performed in each Fisher scoring step.
     armijo_constant : float (optional)
         The Armijo condition parameter.
     max_line_search_iterations : int (optional)
@@ -309,24 +311,27 @@ def _fisher_scoring(
 
     Returns:
     --------
-    theta_new : np.ndarray
+    theta_updated : np.ndarray
         The updated parameters.
     converged : bool
         True if the algorithm converged, False otherwise.
     """
     # Fisher scoring
     converged = False
+    theta_updated = theta
     for _ in range(max_iterations):
         # Calculate the residual and the Jacobian matrix
-        residual = model_function(theta, input_data) - target_data
-        jacobian = jacobian_function(theta, input_data)
+        residual = model_function(theta_updated, input_data) - target_data
+        jacobian = jacobian_function(theta_updated, input_data)
 
         # Estimate the covariance matrix
-        covariance = _estimate_covariance(theta, residual)
+        covariance = _estimate_covariance(theta_updated, residual)
 
         # Calculate the score and the Fisher information matrix (FIM)
         score = -jacobian.T @ np.linalg.solve(covariance, residual) # Note the minus sign, due to the chosen definition of the residual
         fim = jacobian.T @ np.linalg.solve(covariance, jacobian)
+        print(score)
+        print(fim)
 
         # Calculate the Fisher scoring step
         fisher_step = np.linalg.solve(fim, score)
@@ -339,14 +344,14 @@ def _fisher_scoring(
                     "The directional derivative of the log-likelihood must be positive. "
                     "Something is wrong with the input to the Fisher scoring step."
                 )
-            ssr_old = np.sum((model_function(theta, input_data) - target_data)**2)
+            ssr_old = np.sum((model_function(theta_updated, input_data) - target_data)**2)
             damping_factor = 1.0
 
             # Perform the backtracking line search
             line_search_converged = False
             for _ in range(max_line_search_iterations):
-                theta_new = theta + damping_factor * fisher_step
-                ssr_new = np.sum((model_function(theta_new, input_data) - target_data)**2)
+                theta_test = theta_updated + damping_factor * fisher_step
+                ssr_new = np.sum((model_function(theta_test, input_data) - target_data)**2)
 
                 if ssr_new <= ssr_old - armijo_constant * damping_factor * directional_derivative:
                     line_search_converged = True
@@ -356,15 +361,18 @@ def _fisher_scoring(
 
             if not line_search_converged:
                 raise ValueError("The backtracking line search did not converge.")
+            theta_old = theta_updated
+            theta_updated = theta_test
         else:
-            theta_new = theta + fisher_step
+            theta_old = theta_updated
+            theta_updated = theta_updated + fisher_step # Note that a new np.ndarray is allocated here
 
         # Check for Fisher scoring algorithm convergence
-        if np.linalg.norm(theta_new - theta) < 1e-6:
+        if np.linalg.norm(theta_updated - theta_old) < 1e-6:
             converged = True
             break
 
-    return theta_new, converged
+    return theta_updated, converged
 
 def _calculate_score_fim_and_lm_test_statistic(
         model_order_specifier, model_function_full, jacobian_function_full, theta, input_data, target_data):
