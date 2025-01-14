@@ -19,10 +19,11 @@ from scipy.linalg import sqrtm
 
 def solve(
         input_data_list, target_data_list,
-        model_function, jacobian_function,
-        initial_model_order_specifier,
-        expansion_operator,
-        update_operator,
+        model_function=None,
+        jacobian_function=None,
+        initial_model_order_specifier=None,
+        expansion_operator=None,
+        update_operator=None,
         theta_list=None, alpha=0.05,
         max_iterations=100,
         force_continuation=False,
@@ -45,19 +46,24 @@ def solve(
         A 1D array of targets, or a list of 1D arrays of target values. Each array corresponds to a sub-problem (group of data points).
         The number of elements in the list must match the number of input data matrices,
         and the number of elements in each sub-array must match the number of data points in the corresponding sub-problem.
-    model_function : Callable[model_order_specifier : ModelOrderSpecifier, theta : np.ndarray, input_data : np.ndarray] -> np.ndarray
+    model_function : Callable[model_order_specifier : ModelOrderSpecifier, theta : np.ndarray, input_data : np.ndarray] -> np.ndarray (optional)
         Returns the specified model function evaluated with parameters theta at the given input data.
-    jacobian_function : Callable[model_order_specifier : ModelOrderSpecifier, theta : np.ndarray, input_data : np.ndarray] -> np.ndarray
+        If not provided, a Taylor expansion based model is used.
+    jacobian_function : Callable[model_order_specifier : ModelOrderSpecifier, theta : np.ndarray, input_data : np.ndarray] -> np.ndarray (optional)
         Returns the specified model's Jacobian matrix evaluated with parameters theta at the given input data.
-    initial_model_order_specifier : ModelOrderSpecifier
+        If not provided, a Taylor expansion based model is used.
+    initial_model_order_specifier : ModelOrderSpecifier (optional)
         The initial model order specifier. It can be, e.g., an integer, a list of integers, or some other more complex object.
         It must implement __len__(self) -> int to return the number of parameters in the model.
-    expansion_operator : Callable[model_order_specifier : ModelOrderSpecifier] -> tuple[ModelOrderSpecifier, np.ndarray]
+        If not provided, a Taylor expansion based model is assumed, and a zeroth order model is used.
+    expansion_operator : Callable[model_order_specifier : ModelOrderSpecifier] -> tuple[ModelOrderSpecifier, np.ndarray] (optional)
         Returns the expaned model order specifier together with an expansion matrix.
         The expansion matrix can be used to pad theta with zeros to match the size of the expanded model.
-    update_operator : Callable[model_order_specifier : ModelOrderSpecifier, decision_index : int] -> tuple[ModelOrderSpecifier, np.ndarray]
+        If not provided, a Taylor expansion based model is used.
+    update_operator : Callable[model_order_specifier : ModelOrderSpecifier, decision_index : int] -> tuple[ModelOrderSpecifier, np.ndarray] (optional)
         Returns updated model order specifier together with a selection matrix.
         The selection matrix can be used to select the relevant parts of theta, the score and the Fisher information matrix.
+        If not provided, a Taylor expansion based model is used.
     theta_list : Union[np.ndarray, List[np.ndarray]] (optional)
         The initial parameters, or a list of initial parameters, one for each sub-problem (group of data points).
     alpha : float (optional)
@@ -89,6 +95,30 @@ def solve(
         A dictionary containing the Lagrange multiplier (score) test statistic, the critical value, the AIC, the BIC, and the exact BIC.
     """
 
+    # Repackage the input and target data if they are not lists
+    if not isinstance(input_data_list, list):
+        input_data_list = [input_data_list]
+    if not isinstance(target_data_list, list):
+        target_data_list = [target_data_list]
+
+    # If the model function is provided, the Jacobian function must also be provided
+    if model_function or jacobian_function or expansion_operator or update_operator:
+        if not model_function or not jacobian_function or not expansion_operator or not update_operator:
+            raise ValueError("Either all or none of `model_function`, `jacobian_function`, `expansion_operator`, and `update_operator` must be provided.")
+        if not initial_model_order_specifier:
+            raise ValueError("The initial model order specifier must be provided if `model_function`, `jacobian_function`, `expansion_operator`, and `update_operator` are provided.")
+    else:
+        # If no model functions are provided, assume a Taylor expansion model
+        model_function = _taylor_expansion_model_function
+        jacobian_function = _taylor_expansion_jacobian_function
+        expansion_operator = _taylor_expansion_expansion_operator
+        update_operator = _taylor_expansion_update_operator
+
+        if initial_model_order_specifier is None:
+            # If no initial model order specifier is provided,
+            # assume a zeroth order model (i.e., a constant model) as the initial model
+            initial_model_order_specifier = [(0,) * input_data_list[0].shape[1]]
+
     # If the initial model order specifier is an integer, convert it so that len() can be used on it
     if isinstance(initial_model_order_specifier, int):
         model_order_specifier = _IntAsLen(initial_model_order_specifier)
@@ -102,12 +132,6 @@ def solve(
     # Check validity of the initial model order specifier
     if not hasattr(model_order_specifier, "__len__") and not callable(model_order_specifier.__len__):
         raise TypeError("Initial model order specifier must be an int or have a __len__ method.")
-
-    # Repackage the input and target data if they are not lists
-    if not isinstance(input_data_list, list):
-        input_data_list = [input_data_list]
-    if not isinstance(target_data_list, list):
-        target_data_list = [target_data_list]
 
     # Check if the number of input data matrices and target data arrays match
     if len(input_data_list) != len(target_data_list):
@@ -330,8 +354,6 @@ def _fisher_scoring(
         # Calculate the score and the Fisher information matrix (FIM)
         score = -jacobian.T @ np.linalg.solve(covariance, residual) # Note the minus sign, due to the chosen definition of the residual
         fim = jacobian.T @ np.linalg.solve(covariance, jacobian)
-        print(score)
-        print(fim)
 
         # Calculate the Fisher scoring step
         fisher_step = np.linalg.solve(fim, score)
@@ -464,6 +486,156 @@ def _calculate_decision_index_and_transformed_score(model_order_specifier, score
     # If the index corresponds to a constrained parameter, the constraint is relaxed.
     decision_index = nr_of_selected_parameters + np.argmax(np.abs(transformed_score))
     return decision_index, transformed_score
+
+def _assemble_taylor_expansion_design_matrix(model_order_specifier, input_data):
+    """
+    Helper function to assemble the design matrix for a given model order specifier and input data for the Taylor expansion model.
+
+    The model order specifier is a list of tuples, where each tuple contains the powers of the two input variables to be included in the model.
+
+    Parameters:
+    -----------
+    model_order_specifier : List[tuple]
+        The model order specifier.
+    input_data : np.ndarray
+        The input data matrix.
+
+    Returns:
+    --------
+    design_matrix : np.ndarray
+        The design matrix.
+    """
+    design_matrix = np.ones((len(input_data), len(model_order_specifier)))
+    for idx, specifier in enumerate(model_order_specifier):
+        for input_variable_idx, power in enumerate(specifier):
+            design_matrix[:, idx] *= input_data[:, input_variable_idx]**power
+
+    return design_matrix
+
+def _taylor_expansion_model_function(model_order_specifier, theta, input_data):
+    """
+    The model function implementation.
+
+    The predicted value equals the design_matrix times the theta vector for this model.
+    """
+    design_matrix = _assemble_taylor_expansion_design_matrix(model_order_specifier, input_data)
+
+    return design_matrix @ theta
+
+def _taylor_expansion_jacobian_function(model_order_specifier, theta, input_data):
+    """
+    The Jacobian function implementation.
+
+    The Jacobian matrix equals the design matrix for this model.
+    """
+    design_matrix = _assemble_taylor_expansion_design_matrix(model_order_specifier, input_data)
+
+    return design_matrix
+
+def _taylor_expansion_expansion_operator(model_order_specifier):
+    """
+    The expansion operator implementation for the Taylor expansion model.
+    
+    This function adds new parameters to the model order specifier.
+    Each new parameter added corresponds to next order derivative terms
+    with respect to each of the input variables.
+
+    Parameters:
+    -----------
+    model_order_specifier : List[tuple]
+        The model order specifier to expand.
+
+    Returns:
+    --------
+    new_model_order_specifier : List[tuple]
+        The expanded model order specifier.
+    """
+    def _expand_single_parameter_specifier(specifier):
+        """
+        Helper function to expand a single parameter order specifier,
+        adding one higher order derivative term for each input variable.
+
+        Parameters:
+        -----------
+        specifier : tuple
+            The parameter order specifier to expand.
+
+        Returns:
+        --------
+        new_specifiers : List[tuple]
+            A list of the expanded parameter order specifiers.
+        """
+        d = len(specifier) # Get the dimension of the tuple (corresponding to the number of input variables)
+        new_specifiers = []
+        for i in range(d):
+            # Increment the ith element, keeping the others the same
+            new_tuple = tuple(n + 1 if idx == i else n for idx, n in enumerate(specifier))
+            new_specifiers.append(new_tuple)
+        return new_specifiers
+    
+    new_specifiers = [] # Initialize an empty list to store the new specifiers
+    for specifier in model_order_specifier:
+        # Expand each individual parameter specifier
+        candidate_specifiers = _expand_single_parameter_specifier(specifier)
+        # Add any candidate specifiers that are not already in the model order specifier
+        for candidate_specifier in candidate_specifiers:
+            if (candidate_specifier not in model_order_specifier) and (candidate_specifier not in new_specifiers):
+                new_specifiers.append(candidate_specifier)
+
+    # Assemble the new model order specifier
+    new_model_order_specifier = model_order_specifier + new_specifiers
+
+    # Construct the expansion matrix
+    nr_of_selected_parameters = len(model_order_specifier)
+    nr_of_new_parameters = len(new_specifiers)
+    expansion_matrix = np.vstack([
+        np.eye(nr_of_selected_parameters),
+        np.zeros((nr_of_new_parameters, nr_of_selected_parameters))
+    ])
+
+    return new_model_order_specifier, expansion_matrix
+
+def _taylor_expansion_update_operator(model_order_specifier, decision_index):
+    """
+    The update operator implementation for the Taylor expansion model.
+    
+    This function adds a new parameter to the model order specifier, based on the decision index.
+
+    Parameters:
+    -----------
+    model_order_specifier : List[tuple]
+        The current model order specifier.
+    decision_index : int
+        The decision index.
+
+    Returns:
+    --------
+    new_model_order_specifier : List[tuple]
+        The updated model order specifier.
+    selection_matrix : np.ndarray
+        The selection matrix.
+    """
+    # Get the full model order specifier and the expansion matrix
+    full_model_order_specifier, expansion_matrix = _taylor_expansion_expansion_operator(model_order_specifier)
+    nr_of_parameters_full = len(full_model_order_specifier)
+
+    if decision_index < len(model_order_specifier):
+        # If the decision index is one of the existing parameters,
+        # the selection matrix will be the transpose of the expansion matrix.
+        # No new parameters will be added.
+        selection_matrix = expansion_matrix.T
+        new_model_order_specifier = model_order_specifier
+    else:
+        # If the decision index is one of the new parameters,
+        # we need to add a new parameter to the model.
+        selection_matrix = np.vstack([
+            expansion_matrix.T,
+            np.zeros(nr_of_parameters_full)
+        ])
+        selection_matrix[-1, decision_index] = 1 # Select the new parameter
+        new_model_order_specifier = model_order_specifier + [full_model_order_specifier[decision_index]]
+
+    return new_model_order_specifier, selection_matrix
 
 class _IntAsLen:
     def __init__(self, value):
