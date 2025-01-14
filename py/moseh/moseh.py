@@ -178,7 +178,7 @@ def solve(
     padding_matrix = np.eye(len(model_order_specifier))
     for iteration in range(max_iterations):
         print("--- Iteration {} ---".format(iteration + 1)) if verbose else None
-        print("Model order: {}\n".format(len(model_order_specifier))) if verbose else None
+        print("Model order: {}".format(len(model_order_specifier))) if verbose else None
 
         # Set up helper functions for the Fisher scoring algorithm
         model_function_selected = lambda theta, input_data: model_function(model_order_specifier, theta, input_data)
@@ -243,8 +243,11 @@ def solve(
         # Perform the hypothesis test
         if lm_test_statistic <= critical_value:
             converged = True
+            print("Converged!") if verbose else None
             if not force_continuation:
                 break
+            converged = False
+            print("Overriding... Forced continue!") if verbose else None
 
         # Set up a helper function for the constraint relaxation decision
         decision_subroutine = lambda score, fim: _calculate_decision_index_and_transformed_score(model_order_specifier, score, fim)
@@ -258,13 +261,21 @@ def solve(
         # Calculate the decision index as the mode of the decision indeces
         # @TODO: Check other selection rules, e.g., using an average of the transformed scores instead
         decision_index, _ = mode(decision_indeces)
-        print("Decision index: {}".format(decision_index)) if verbose else None
+        print("Decision index: {}\n".format(decision_index)) if verbose else None
 
         # Update the model order specifier and the selection matrix, based on the decision index
         model_order_specifier, selection_matrix = update_operator(model_order_specifier, decision_index)
 
         # Update the padding matrix, to account for the newly added parameters in the next iteration
         padding_matrix = selection_matrix @ expansion_matrix
+
+    # Pad the theta vectors with zeros to match the final model order specifier if not converged.
+    # Otherwise, the theta vectors are already padded with zeros.
+    if not converged:
+        theta_list = Parallel(n_jobs=-1)(
+            delayed(lambda x: padding_matrix @ x)(theta)
+            for theta in theta_list
+        )
 
     # If the initial model order specifier was an integer, convert it back to an integer
     if isinstance(initial_model_order_specifier, int):
