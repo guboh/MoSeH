@@ -48,22 +48,22 @@ def solve(
         and the number of elements in each sub-array must match the number of data points in the corresponding sub-problem.
     model_function : Callable[model_order_specifier : ModelOrderSpecifier, theta : np.ndarray, input_data : np.ndarray] -> np.ndarray (optional)
         Returns the specified model function evaluated with parameters theta at the given input data.
-        If not provided, a Taylor expansion based model is used.
+        If not provided, a Taylor series expansion based model is used.
     jacobian_function : Callable[model_order_specifier : ModelOrderSpecifier, theta : np.ndarray, input_data : np.ndarray] -> np.ndarray (optional)
         Returns the specified model's Jacobian matrix evaluated with parameters theta at the given input data.
-        If not provided, a Taylor expansion based model is used.
+        If not provided, a Taylor series expansion based model is used.
     initial_model_order_specifier : ModelOrderSpecifier (optional)
         The initial model order specifier. It can be, e.g., an integer, a list of integers, or some other more complex object.
         It must implement __len__(self) -> int to return the number of parameters in the model.
-        If not provided, a Taylor expansion based model is assumed, and a zeroth order model is used.
+        If not provided, a Taylor series expansion based model is assumed, and a zeroth order model is used.
     expansion_operator : Callable[model_order_specifier : ModelOrderSpecifier] -> tuple[ModelOrderSpecifier, np.ndarray] (optional)
         Returns the expaned model order specifier together with an expansion matrix.
         The expansion matrix can be used to pad theta with zeros to match the size of the expanded model.
-        If not provided, a Taylor expansion based model is used.
+        If not provided, a Taylor series expansion based model is used.
     update_operator : Callable[model_order_specifier : ModelOrderSpecifier, decision_index : int] -> tuple[ModelOrderSpecifier, np.ndarray] (optional)
         Returns updated model order specifier together with a selection matrix.
         The selection matrix can be used to select the relevant parts of theta, the score and the Fisher information matrix.
-        If not provided, a Taylor expansion based model is used.
+        If not provided, a Taylor series expansion based model is used.
     theta_list : Union[np.ndarray, List[np.ndarray]] (optional)
         The initial parameters, or a list of initial parameters, one for each sub-problem (group of data points).
     alpha : float (optional)
@@ -108,11 +108,11 @@ def solve(
         if not initial_model_order_specifier:
             raise ValueError("The initial model order specifier must be provided if `model_function`, `jacobian_function`, `expansion_operator`, and `update_operator` are provided.")
     else:
-        # If no model functions are provided, assume a Taylor expansion model
-        model_function = _taylor_expansion_model_function
-        jacobian_function = _taylor_expansion_jacobian_function
-        expansion_operator = _taylor_expansion_expansion_operator
-        update_operator = _taylor_expansion_update_operator
+        # If no model functions are provided, assume a Taylor series expansion model
+        model_function = _taylor_series_model_function
+        jacobian_function = _taylor_series_jacobian_function
+        expansion_operator = _taylor_series_expansion_operator
+        update_operator = _taylor_series_update_operator
 
         if initial_model_order_specifier is None:
             # If no initial model order specifier is provided,
@@ -498,9 +498,9 @@ def _calculate_decision_index_and_transformed_score(model_order_specifier, score
     decision_index = nr_of_selected_parameters + np.argmax(np.abs(transformed_score))
     return decision_index, transformed_score
 
-def _assemble_taylor_expansion_design_matrix(model_order_specifier, input_data):
+def _assemble_taylor_series_design_matrix(model_order_specifier, input_data):
     """
-    Helper function to assemble the design matrix for a given model order specifier and input data for the Taylor expansion model.
+    Helper function to assemble the design matrix for a given model order specifier and input data for the Taylor series expansion model.
 
     The model order specifier is a list of tuples, where each tuple contains the powers of the two input variables to be included in the model.
 
@@ -523,29 +523,57 @@ def _assemble_taylor_expansion_design_matrix(model_order_specifier, input_data):
 
     return design_matrix
 
-def _taylor_expansion_model_function(model_order_specifier, theta, input_data):
+def _taylor_series_model_function(model_order_specifier, theta, input_data):
     """
-    The model function implementation.
+    The model function implementation for the Taylor series expansion model.
 
     The predicted value equals the design_matrix times the theta vector for this model.
+
+    Parameters:
+    -----------
+    model_order_specifier : List[tuple]
+        The model order specifier.
+    theta : np.ndarray
+        The parameter vector.
+    input_data : np.ndarray
+        The input data matrix.
+
+    Returns:
+    --------
+    output : np.ndarray
+        The model output.
     """
-    design_matrix = _assemble_taylor_expansion_design_matrix(model_order_specifier, input_data)
+    design_matrix = _assemble_taylor_series_design_matrix(model_order_specifier, input_data)
 
     return design_matrix @ theta
 
-def _taylor_expansion_jacobian_function(model_order_specifier, theta, input_data):
+def _taylor_series_jacobian_function(model_order_specifier, theta, input_data):
     """
-    The Jacobian function implementation.
+    The Jacobian function implementation fir the Taylor series expansion model.
 
     The Jacobian matrix equals the design matrix for this model.
+
+    Parameters:
+    -----------
+    model_order_specifier : List[tuple]
+        The model order specifier.
+    theta : np.ndarray
+        The parameter vector.
+    input_data : np.ndarray
+        The input data matrix.
+
+    Returns:
+    --------
+    jacobian_matrix : np.ndarray
+        The Jacobian matrix.
     """
-    design_matrix = _assemble_taylor_expansion_design_matrix(model_order_specifier, input_data)
+    design_matrix = _assemble_taylor_series_design_matrix(model_order_specifier, input_data)
 
     return design_matrix
 
-def _taylor_expansion_expansion_operator(model_order_specifier):
+def _taylor_series_expansion_operator(model_order_specifier):
     """
-    The expansion operator implementation for the Taylor expansion model.
+    The expansion operator implementation for the Taylor series expansion model.
     
     This function adds new parameters to the model order specifier.
     Each new parameter added corresponds to next order derivative terms
@@ -606,9 +634,9 @@ def _taylor_expansion_expansion_operator(model_order_specifier):
 
     return new_model_order_specifier, expansion_matrix
 
-def _taylor_expansion_update_operator(model_order_specifier, decision_index):
+def _taylor_series_update_operator(model_order_specifier, decision_index):
     """
-    The update operator implementation for the Taylor expansion model.
+    The update operator implementation for the Taylor series expansion model.
     
     This function adds a new parameter to the model order specifier, based on the decision index.
 
@@ -627,7 +655,7 @@ def _taylor_expansion_update_operator(model_order_specifier, decision_index):
         The selection matrix.
     """
     # Get the full model order specifier and the expansion matrix
-    full_model_order_specifier, expansion_matrix = _taylor_expansion_expansion_operator(model_order_specifier)
+    full_model_order_specifier, expansion_matrix = _taylor_series_expansion_operator(model_order_specifier)
     nr_of_parameters_full = len(full_model_order_specifier)
 
     if decision_index < len(model_order_specifier):
