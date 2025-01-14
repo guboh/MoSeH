@@ -372,7 +372,7 @@ def _fisher_scoring(
         if line_search:
             # Perform the backtracking line search
             directional_derivative = score @ fisher_step
-            if directional_derivative < 0.1:
+            if directional_derivative < 0:
                 raise ValueError(
                     "The directional derivative of the log-likelihood must be positive. "
                     "Something is wrong with the input to the Fisher scoring step."
