@@ -178,6 +178,7 @@ def solve(
     padding_matrix = np.eye(len(model_order_specifier))
     for iteration in range(max_iterations):
         print("--- Iteration {} ---".format(iteration + 1)) if verbose else None
+        print("Model order: {}\n".format(len(model_order_specifier))) if verbose else None
 
         # Set up helper functions for the Fisher scoring algorithm
         model_function_selected = lambda theta, input_data: model_function(model_order_specifier, theta, input_data)
@@ -261,7 +262,6 @@ def solve(
 
         # Update the model order specifier and the selection matrix, based on the decision index
         model_order_specifier, selection_matrix = update_operator(model_order_specifier, decision_index)
-        print("Model order: {}\n".format(len(model_order_specifier))) if verbose else None
 
         # Update the padding matrix, to account for the newly added parameters in the next iteration
         padding_matrix = selection_matrix @ expansion_matrix
