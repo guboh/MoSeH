@@ -225,7 +225,8 @@ def solve(
         bic_exact = np.sum(bic_exact_list)
 
         # Prepare for the hypothesis test
-        nr_of_constraints = len(input_data) * (len(model_order_specifier_full) - len(model_order_specifier))
+        nr_of_constraints = len(target_data_list) * (len(model_order_specifier_full) - len(model_order_specifier))
+        print("Number of constraints: {}".format(nr_of_constraints)) if verbose else None
         critical_value = chi2.ppf(1-alpha, nr_of_constraints)
 
         # Print the results of the current iteration
