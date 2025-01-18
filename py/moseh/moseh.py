@@ -284,9 +284,9 @@ def solve(
 
     return model_order_specifier, theta_list, converged, result_dict
 
-def _estimate_covariance(theta, residual, unbiased=True):
+def _estimate_variance(theta, residual, unbiased=True):
     """
-    Estimate the covariance of the residuals.
+    Estimate the variance of the residuals.
 
     Parameters:
     -----------
@@ -299,8 +299,8 @@ def _estimate_covariance(theta, residual, unbiased=True):
 
     Returns:
     --------
-    covariance : np.ndarray
-        The estimated covariance matrix.
+    variance : np.ndarray
+        The estimated variance.
     """
 
     if unbiased:
@@ -308,9 +308,7 @@ def _estimate_covariance(theta, residual, unbiased=True):
     else:
         sigma_squared = np.sum(residual**2) / len(residual)
 
-    covariance = np.diag(np.full(len(residual), sigma_squared))
-
-    return covariance
+    return sigma_squared
 
 def _fisher_scoring(
         model_function, jacobian_function,
@@ -360,12 +358,12 @@ def _fisher_scoring(
         residual = model_function(theta_updated, input_data) - target_data
         jacobian = jacobian_function(theta_updated, input_data)
 
-        # Estimate the covariance matrix
-        covariance = _estimate_covariance(theta_updated, residual)
+        # Estimate the variance
+        variance = _estimate_variance(theta_updated, residual)
 
         # Calculate the score and the Fisher information matrix (FIM)
-        score = -jacobian.T @ np.linalg.solve(covariance, residual) # Note the minus sign, due to the chosen definition of the residual
-        fim = jacobian.T @ np.linalg.solve(covariance, jacobian)
+        score = -jacobian.T @ residual / variance # Note the minus sign, due to the chosen definition of the residual
+        fim = jacobian.T @ jacobian / variance
 
         # Calculate the Fisher scoring step
         fisher_step = np.linalg.solve(fim, score)
@@ -442,12 +440,12 @@ def _calculate_score_fim_and_lm_test_statistic(
     residual = model_function_full(theta, input_data) - target_data
     jacobian = jacobian_function_full(theta, input_data)
 
-    # Calculate the covariance matrix
-    covariance = _estimate_covariance(theta, residual)
+    # Calculate the variance
+    variance = _estimate_variance(theta, residual)
 
     # Calculate the full model's score and Fisher information matrix (FIM)
-    score = -jacobian.T @ np.linalg.solve(covariance, residual) # Note the minus sign, due to the chosen definition of the residual
-    fim = jacobian.T @ np.linalg.solve(covariance, jacobian)
+    score = -jacobian.T @ residual / variance # Note the minus sign, due to the chosen definition of the residual
+    fim = jacobian.T @ jacobian / variance
 
     nr_of_data_points = len(target_data)
     nr_of_selected_parameters = len(model_order_specifier)
@@ -488,10 +486,10 @@ def _calculate_decision_index_and_transformed_score(model_order_specifier, score
     fim = fim_full[:nr_of_selected_parameters, :nr_of_selected_parameters]
     fim_extra_diagonal_block = fim_full[nr_of_selected_parameters:, nr_of_selected_parameters:]
     fim_extra_cross_term_block = fim_full[nr_of_selected_parameters:, :nr_of_selected_parameters]
-    covariance_extra = fim_extra_diagonal_block - fim_extra_cross_term_block @ np.linalg.solve(fim, fim_extra_cross_term_block.T)
+    schur_complement = fim_extra_diagonal_block - fim_extra_cross_term_block @ np.linalg.solve(fim, fim_extra_cross_term_block.T)
 
     # Transform (whiten) the score vector
-    transformed_score = np.linalg.solve(sqrtm(covariance_extra), score_full[nr_of_selected_parameters:])
+    transformed_score = np.linalg.solve(sqrtm(schur_complement), score_full[nr_of_selected_parameters:])
 
     # Calculate the decision index.
     # The index corresponds to the parameter that has the largest absolute value in the transformed score vector.
