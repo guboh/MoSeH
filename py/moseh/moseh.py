@@ -31,7 +31,8 @@ def solve(
         max_inner_iterations=100,
         line_search=True,
         armijo_constant=1e-4,
-        max_line_search_iterations=100
+        max_line_search_iterations=100,
+        levenberg_marquardt=False
     ):
     """
     Model-Order Selection via Sequential Lagrange Multiplier Hypothesis Testing (MoSeH).
@@ -82,6 +83,8 @@ def solve(
         The Armijo condition parameter.
     max_line_search_iterations : int (optional)
         The maximum number of iterations in the line search.
+    levenberg_marquardt : bool (optional)
+        If True, the Levenberg-Marquardt algorithm is used instead of the Fisher scoring algorithm.
 
     Returns:
     --------
@@ -183,19 +186,27 @@ def solve(
         # Set up helper functions for the Fisher scoring algorithm
         model_function_selected = lambda theta, input_data: model_function(model_order_specifier, theta, input_data)
         jacobian_function_selected = lambda theta, input_data: jacobian_function(model_order_specifier, theta, input_data)
-        fisher_scoring_subroutine = lambda theta, input_data, target_data: _fisher_scoring(
-            model_function_selected,
-            jacobian_function_selected,
-            theta, input_data, target_data,
-            max_iterations=max_inner_iterations,
-            line_search=line_search,
-            armijo_constant=armijo_constant,
-            max_line_search_iterations=max_line_search_iterations
-        )
+        if levenberg_marquardt:
+            scoring_subroutine = lambda theta, input_data, target_data: _levenberg_marquardt(
+                model_function_selected,
+                jacobian_function_selected,
+                theta, input_data, target_data,
+                max_iterations=max_inner_iterations
+            )
+        else:
+            scoring_subroutine = lambda theta, input_data, target_data: _fisher_scoring(
+                model_function_selected,
+                jacobian_function_selected,
+                theta, input_data, target_data,
+                max_iterations=max_inner_iterations,
+                line_search=line_search,
+                armijo_constant=armijo_constant,
+                max_line_search_iterations=max_line_search_iterations
+            )
 
         # Perform Fisher scoring with backtracking line search in parallel for each sub-problem
         result = Parallel(n_jobs=-1)(
-            delayed(fisher_scoring_subroutine)(padding_matrix @ theta, input_data, target_data) # Note that theta is padded with zeros, to match the selected model
+            delayed(scoring_subroutine)(padding_matrix @ theta, input_data, target_data) # Note that theta is padded with zeros, to match the selected model
             for theta, input_data, target_data in zip(theta_list, input_data_list, target_data_list)
         )
         theta_list, _ = zip(*result) # Unpack the results
@@ -316,9 +327,8 @@ def _fisher_scoring(
         max_iterations=100,
         line_search=True,
         armijo_constant=1e-4,
-        max_line_search_iterations=100,
-
-        ):
+        max_line_search_iterations=100
+    ):
     """
     Update the parameters theta using the Fisher scoring algorithm with (optional) backtracking line search.
 
@@ -358,25 +368,27 @@ def _fisher_scoring(
         residual = model_function(theta_updated, input_data) - target_data
         jacobian = jacobian_function(theta_updated, input_data)
 
-        # Estimate the variance
-        variance = _estimate_variance(theta_updated, residual)
+        # Calculate the sum of squared residuals (SSR)
+        ssr = np.sum(residual**2)
 
-        # Calculate the score and the Fisher information matrix (FIM)
-        score = -jacobian.T @ residual / variance # Note the minus sign, due to the chosen definition of the residual
-        fim = jacobian.T @ jacobian / variance
+        # Calculate the unnormalized score and Fisher information matrix (FIM)
+        # The real score and FIM should be divided by the variance, but this is not necessary for the algorithm,
+        # since the variance cancels out in the Fisher scoring step.
+        score_unnormalized = -jacobian.T @ residual # Note the minus sign, due to the chosen definition of the residual
+        fim_unnormalized = jacobian.T @ jacobian
 
         # Calculate the Fisher scoring step
-        fisher_step = np.linalg.solve(fim, score)
+        fisher_step = np.linalg.solve(fim_unnormalized, score_unnormalized)
 
         if line_search:
             # Perform the backtracking line search
-            directional_derivative = score @ fisher_step
+            directional_derivative = score_unnormalized @ fisher_step
             if directional_derivative < 0:
                 raise ValueError(
                     "The directional derivative of the log-likelihood must be positive. "
                     "Something is wrong with the input to the Fisher scoring step."
                 )
-            ssr_old = np.sum((model_function(theta_updated, input_data) - target_data)**2)
+
             damping_factor = 1.0
 
             # Perform the backtracking line search
@@ -385,7 +397,7 @@ def _fisher_scoring(
                 theta_test = theta_updated + damping_factor * fisher_step
                 ssr_new = np.sum((model_function(theta_test, input_data) - target_data)**2)
 
-                if ssr_new <= ssr_old - armijo_constant * damping_factor * directional_derivative:
+                if ssr_new <= ssr - armijo_constant * damping_factor * directional_derivative:
                     line_search_converged = True
                     break
 
@@ -401,6 +413,80 @@ def _fisher_scoring(
 
         # Check for Fisher scoring algorithm convergence
         if np.linalg.norm(theta_updated - theta_old) < 1e-6:
+            converged = True
+            break
+
+    return theta_updated, converged
+
+def _levenberg_marquardt(
+        model_function, jacobian_function,
+        theta, input_data, target_data,
+        max_iterations=100
+    ):
+    """
+    Update the parameters theta using the Levenberg-Marquardt algorithm.
+
+    Parameters:
+    -----------
+    model_function : Callable[theta : np.ndarray, input_data : np.ndarray] -> np.ndarray
+        Returns the specified model function evaluated with parameters theta at the given input data.
+    jacobian_function : Callable[model_order_specifier : ModelOrderSpecifier, theta : np.ndarray, input_data : np.ndarray] -> np.ndarray
+        Returns the specified model's Jacobian matrix evaluated with parameters theta at the given input data.
+    theta : np.ndarray
+        The estimated parameters.
+    input_data : np.ndarray (optional)
+        The input data matrix. It is needed by the line search.
+    target_data : np.ndarray (optional)
+        The target data array. It is needed by the line search.
+    max_iterations : int (optional)
+        The maximum number of iterations in the Levenberg-Marquardt algorithm.
+
+    Returns:
+    --------
+    theta_updated : np.ndarray
+        The updated parameters.
+    converged : bool
+        True if the algorithm converged, False otherwise.
+    """
+    converged = False
+    theta_updated = theta
+    damping_matrix = np.eye(len(theta)) # Initialize the damping factor as the identity matrix
+    for _ in range(max_iterations):
+        # Calculate the residual and the Jacobian matrix
+        residual = model_function(theta_updated, input_data) - target_data
+        jacobian = jacobian_function(theta_updated, input_data)
+
+        # Calculate the sum of squared residuals (SSR)
+        ssr = np.sum(residual**2)
+
+        # Calculate the unnormalized score and Fisher information matrix (FIM)
+        # The real score and FIM should be divided by the variance, but this is not necessary for the algorithm,
+        # since the variance cancels out in the Fisher scoring step.
+        score_unnormalized = -jacobian.T @ residual # Note the minus sign, due to the chosen definition of the residual
+        fim_unnormalized = jacobian.T @ jacobian
+
+        # Calculate the damped Fisher scoring step
+        fisher_step = np.linalg.solve(fim_unnormalized + damping_matrix, score_unnormalized)
+
+        # Check that the directional derivative is non-negative
+        directional_derivative = score_unnormalized @ fisher_step
+        if directional_derivative < 0:
+            raise ValueError(
+                "The directional derivative of the log-likelihood must be positive. "
+                "Something is wrong with the input to the Fisher scoring step."
+            )
+
+        theta_test = theta_updated + fisher_step
+        ssr_new = np.sum((model_function(theta_test, input_data) - target_data)**2)
+
+        if ssr_new < ssr:
+            theta_updated = theta_test
+            damping_matrix /= 2
+        else:
+            damping_matrix *= 2
+
+        # Check for convergence
+        if (ssr_new - ssr) / ssr < 1e-10:
             converged = True
             break
 
@@ -573,7 +659,7 @@ def _taylor_series_jacobian_function(model_order_specifier, theta, input_data):
 def _taylor_series_expansion_operator(model_order_specifier):
     """
     The expansion operator implementation for the Taylor series expansion model.
-    
+
     This function adds new parameters to the model order specifier.
     Each new parameter added corresponds to next order derivative terms
     with respect to each of the input variables.
@@ -610,7 +696,7 @@ def _taylor_series_expansion_operator(model_order_specifier):
             new_tuple = tuple(n + 1 if idx == i else n for idx, n in enumerate(specifier))
             new_specifiers.append(new_tuple)
         return new_specifiers
-    
+
     new_specifiers = [] # Initialize an empty list to store the new specifiers
     for specifier in model_order_specifier:
         # Expand each individual parameter specifier
@@ -636,7 +722,7 @@ def _taylor_series_expansion_operator(model_order_specifier):
 def _taylor_series_update_operator(model_order_specifier, decision_index):
     """
     The update operator implementation for the Taylor series expansion model.
-    
+
     This function adds a new parameter to the model order specifier, based on the decision index.
 
     Parameters:
